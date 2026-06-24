@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13', '3.14']
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive  # vendored zlib-ng + zstd
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libsqlite3-dev
+
+      - name: Install package (with build + dev deps)
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -e .[dev]
+          # Editable installs don't place the compiled .so next to the sources,
+          # which the pytest `pythonpath = ["."]` config imports, build them in
+          # place explicitly so the C/Cython extensions are importable.
+          python setup.py build_ext --inplace
+
+      - name: Lint (ruff)
+        run: ruff check lazybgen tests setup.py
+
+      - name: Check formatting (black)
+        # Vendored-tree exclude lives in [tool.black] extend-exclude.
+        run: black --check lazybgen tests setup.py
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  # Quick sanity build of sdist + a single wheel on Linux, so packaging
+  # breakage is caught on every PR without paying for the full wheel matrix.
+  build-sanity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libsqlite3-dev
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade pip build twine check-wheel-contents
+          python -m build
+
+      - name: Check artifacts (twine)
+        run: twine check dist/*
+
+      - name: Check wheel is lean (no sources / vendored libs; has py.typed)
+        run: check-wheel-contents dist/*.whl
+
+      - name: Verify sdist vendors the compression submodules
+        run: |
+          tar tzf dist/*.tar.gz | grep -q 'lazybgen/zstd/lib/zstd.h' \
+            && tar tzf dist/*.tar.gz | grep -q 'lazybgen/zlib-ng/' \
+            && echo "✓ sdist contains vendored zlib-ng + zstd"
+
+      - name: Install the built wheel in a clean venv and import
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install --upgrade pip
+          WHEEL="$(ls "$PWD"/dist/*.whl)"
+          /tmp/clean/bin/pip install "$WHEEL"
+          # Run from outside the repo so the source ./lazybgen (no compiled .so)
+          # doesn't shadow the installed wheel on sys.path.
+          cd /tmp
+          /tmp/clean/bin/python -c "import lazybgen; from lazybgen import load_bgen, BgenReader, load_variant_filter, reader; print('✓ wheel imports cleanly')"

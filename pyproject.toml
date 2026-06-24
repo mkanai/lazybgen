@@ -1,0 +1,123 @@
+[build-system]
+# Build against NumPy 2.x: the resulting extensions are ABI-compatible with
+# runtime NumPy >= 1.23 and forward-compatible with 2.x (one wheel covers both).
+requires = ["setuptools>=77", "wheel", "Cython>=0.29.0", "numpy>=2.0.0", "cmake>=3.12"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lazybgen"
+version = "0.1.0"
+description = "High-performance BGEN reader with cloud (GCS/S3) partial-read support"
+readme = "README.md"
+authors = [
+    {name = "Masahiro Kanai", email = "mkanai@broadinstitute.org"}
+]
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+keywords = ["bgen", "genetics", "genomics", "gwas", "bioinformatics", "dosage", "gcs", "s3"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Typing :: Typed",
+]
+dependencies = [
+    # Floor matches the runtime ABI of NumPy-2.x-built wheels (see [build-system]).
+    "numpy>=1.23.0",
+    "pandas>=1.0.0",
+    "gcsfs>=0.7.0",
+    "fsspec>=2021.0.0",
+    "tqdm>=4.50.0",
+]
+
+[project.optional-dependencies]
+s3 = ["s3fs>=2021.0.0"]
+dev = [
+    "pytest>=6.0.0",
+    "black>=25.11.0",  # last black supporting py3.9 (still in the matrix); 26.x needs >=3.10
+    "Cython>=0.29.0",
+    "cmake>=3.12",
+    "ruff>=0.6.0",
+    "check-wheel-contents>=0.6.0",  # guards against wheel bloat / missing py.typed
+    # "bgen>=1.8.0",  # optional: enables correctness comparison vs a reference reader
+]
+
+[project.urls]
+"Homepage" = "https://github.com/mkanai/lazybgen"
+"Repository" = "https://github.com/mkanai/lazybgen"
+"Changelog" = "https://github.com/mkanai/lazybgen/blob/master/CHANGELOG.md"
+"Bug Tracker" = "https://github.com/mkanai/lazybgen/issues"
+
+[tool.setuptools]
+# Keep the wheel lean: ship only .py + compiled .so. The C/Cython sources and
+# vendored zlib-ng/zstd trees are build-time-only (statically linked into the
+# extensions) and stay in the sdist, not the installed wheel.
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lazybgen*"]
+exclude = ["lazybgen.zlib-ng*", "lazybgen.zstd*"]
+
+[tool.setuptools.package-data]
+# PEP 561 marker so type-checkers pick up lazybgen's hints (must be listed
+# explicitly since include-package-data is off).
+lazybgen = ["py.typed"]
+
+[tool.black]
+line-length = 120
+# Vendored libs and the Cython-generated _build_config are not ours to format.
+extend-exclude = '/(zlib-ng|zstd)/|_build_config\.py'
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+# Vendored libs and the Cython-generated _build_config are not ours to lint.
+extend-exclude = ["lazybgen/zlib-ng", "lazybgen/zstd", "lazybgen/_build_config.py"]
+
+[tool.ruff.lint]
+# pycodestyle errors, pyflakes, warnings, import sorting. Formatting stays with black.
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+# Make the in-place-built package importable without an install step.
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "integration: tests that require external resources (e.g. the shared public GCS test bucket)",
+]
+
+[tool.cibuildwheel]
+# Use PEP 517 `build` so the [build-system].requires toolchain (cmake, Cython,
+# numpy) is provisioned under isolation. Vendored zlib-ng/zstd come from the
+# recursive submodule checkout in the workflow.
+build-frontend = "build"
+# cibuildwheel builds CPython only by default (PyPy is opt-in via `enable`), so
+# only the 32-bit / Windows targets need skipping here.
+# cp314t (free-threaded) is skipped for now: the extension does not yet declare
+# free-threading support (it would re-enable the GIL on import), and validating
+# real no-GIL thread-safety is deferred to a later release. Free-threaded users
+# can still build from the sdist.
+skip = ["cp314t-*", "*-musllinux_i686", "*_i686", "*-win32"]
+# Smoke test each built wheel: importing the compiled extensions proves the
+# wheel links its bundled zlib-ng/zstd/sqlite correctly in a clean environment.
+test-command = "python -c \"import lazybgen; from lazybgen import load_bgen, BgenReader, load_variant_filter, reader; print('wheel import OK')\""
+
+[tool.cibuildwheel.linux]
+# manylinux/musllinux containers need sqlite headers; cmake comes from the
+# build-system requires (the `cmake` wheel) under build isolation.
+before-all = "yum install -y sqlite-devel || apk add --no-cache sqlite-dev || true"
+
+[tool.cibuildwheel.macos]
+# arm64 wheels require a 11.0+ deployment target (see setup.py zlib-ng cmake).
+environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }

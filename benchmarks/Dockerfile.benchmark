@@ -1,0 +1,65 @@
+# Multi-stage Dockerfile for benchmarking a specific lazybgen commit.
+#
+# Stage 1 checks out the requested commit from the build context (the repo,
+# including .git and the populated submodule working trees) and re-materializes
+# the vendored submodules (zlib-ng, zstd) pinned by that commit.
+# Stage 2 builds the Cython/C++ extension in place and runs the benchmark.
+#
+# The benchmark script itself is NOT baked in: benchmark_commits.sh bind-mounts
+# the current benchmarks/ over /app/benchmarks, so every commit is measured with
+# the same harness.
+
+FROM python:3.11-slim AS git-checkout
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+WORKDIR /repo
+COPY . .
+ARG GIT_COMMIT=HEAD
+RUN if [ -d .git ]; then \
+        git fetch --unshallow 2>/dev/null || true; \
+        git reset --hard HEAD && \
+        git clean -fdx && \
+        git checkout ${GIT_COMMIT} && \
+        git log -1 --format="%H %cd %s" --date=iso-strict > /tmp/COMMIT_INFO.txt && \
+        git rev-parse HEAD > /tmp/COMMIT_HASH.txt && \
+        git clean -fdx && \
+        # Re-materialize vendored submodules for this commit (zlib-ng, zstd).
+        git submodule update --init --recursive; \
+    else \
+        echo "ERROR: No .git directory found" && exit 1; \
+    fi
+
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y \
+        gcc g++ cmake make \
+        sqlite3 libsqlite3-dev \
+        git \
+        linux-perf \
+        graphviz \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=git-checkout /repo .
+COPY --from=git-checkout /tmp/COMMIT_INFO.txt /app/COMMIT_INFO.txt
+COPY --from=git-checkout /tmp/COMMIT_HASH.txt /app/COMMIT_HASH.txt
+
+# Build deps + benchmark/profiling deps. We do NOT override CFLAGS/CXXFLAGS:
+# lazybgen's setup.py manages its own optimization flags (AVX2 detection, and
+# the deliberate omission of -ffast-math on NaN-dependent decode TUs). Forcing
+# flags here could silently change decode semantics across commits.
+RUN pip install --upgrade pip && \
+    pip install numpy cython pandas psutil && \
+    pip install gprof2dot snakeviz || true
+
+# Build the extension in place so `import lazybgen` (from /app) resolves to the
+# freshly built .so for THIS commit. Editable install wires up metadata + deps.
+RUN python setup.py build_ext --inplace && \
+    pip install -e . --no-build-isolation
+
+RUN mkdir -p /data/test_data /results
+
+ENV PYTHONUNBUFFERED=1
+# Import resolves /app/lazybgen (the in-place build) first.
+ENV PYTHONPATH=/app
+
+# perf needs --cap-add=SYS_ADMIN at `docker run` time for C++-level profiling.
+CMD ["python", "-c", "import lazybgen; print('lazybgen', lazybgen.__file__)"]

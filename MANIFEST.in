@@ -1,0 +1,34 @@
+include LICENSE
+include README.md
+include CHANGELOG.md
+include pyproject.toml
+include setup.py
+
+# Cython sources and headers for the BGEN extensions
+recursive-include lazybgen *.pyx *.pxd *.pxi
+recursive-include lazybgen *.cpp *.h *.hpp
+
+# Exclude build-generated files, both regenerated at build time:
+#  - reader.cpp: the Cython output. Cython is a build-system requirement, so it
+#    is regenerated from reader.pyx; a checked-in copy also embeds build-host
+#    absolute include paths.
+#  - _build_config.py: written at build time to record the compression backend,
+#    so a shipped copy would be a stale snapshot.
+exclude lazybgen/reader.cpp
+exclude lazybgen/_build_config.py
+
+# Vendored compression libraries (zlib-ng, zstd submodules)
+recursive-include lazybgen/zlib-ng *
+recursive-include lazybgen/zstd *
+
+# Tests + fixtures: shipped in the sdist (so downstream packagers can verify a
+# build), but NOT in the wheel; tests/ is a sibling of the package, so it is
+# excluded from the installed package automatically.
+recursive-include tests *.py
+recursive-include tests/data *.bgen *.bgi *.sample
+
+global-exclude *.so
+global-exclude *.html
+global-exclude __pycache__/*
+# Submodule gitlink pointer files reference build-host .git paths; keep them out.
+global-exclude */.git

@@ -1,0 +1,16 @@
+# Keep the benchmark build context small. The .git tree IS needed (the
+# benchmark Dockerfile checks out a specific commit), so it is not excluded.
+benchmarks/test_data
+benchmark_results
+benchmark_logs
+comparison_results
+**/__pycache__
+**/*.pyc
+.venv
+venv
+*.egg-info
+build
+dist
+docs/superpowers
+.superpowers
+local/

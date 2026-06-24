@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # Keep GitHub Actions (checkout, setup-python, cibuildwheel, ...) current.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    commit-message:
+      prefix: "ci"
+
+  # Keep Python dependencies (pyproject) current.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    commit-message:
+      prefix: "deps"

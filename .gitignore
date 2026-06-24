@@ -1,0 +1,41 @@
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Cython-generated sources (regenerated from .pyx at build time)
+lazybgen/reader.cpp
+lazybgen/*.html
+
+# Auto-generated at build time
+lazybgen/_build_config.py
+
+# Compiled extensions
+*.so
+*.pyd
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local dev handover/notes (not part of the package)
+# local/ holds working memos (HANDOVER.md, NOTES.md, dev-history docs);
+# CLAUDE.md stays at root (in-house working notes) but is not shipped.
+CLAUDE.md
+local/
+.superpowers/
+docs/superpowers/
+benchmarks/test_data/
+benchmark_results/
+benchmark_logs/
+comparison_results/
+benchmarks/compare_results*.json
