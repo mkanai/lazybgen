@@ -30,7 +30,7 @@ jobs:
           submodules: recursive  # vendored zlib-ng + zstd must be present
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v4.1.0
+        uses: pypa/cibuildwheel@v4.1.1
         # All build config (skips, before-all, test-command, macOS target)
         # lives in [tool.cibuildwheel] in pyproject.toml.
 
