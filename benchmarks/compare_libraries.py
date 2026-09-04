@@ -53,8 +53,15 @@ SIZES = [
     ("500k x 10k", 500000, 10000),
 ]
 
-REGION_VARIANTS = 500  # contiguous block for the `region` workload
-SCATTERED_VARIANTS = 200  # spread-out lookups for the `scattered` workload
+# Variants read by the slice workloads. Sized so the measured read stays well
+# clear of timer and scheduler noise now that the reader is fast: at 500 and 200
+# a 5k-sample region read was ~6 ms, where a few hundred microseconds of jitter
+# is a visible "regression". These land the same read at tens of ms small and
+# ~1 s at 500k samples. They are the ladder's constant, so a run that changes
+# them is not comparable with one that does not; --region-variants and
+# --scattered-variants exist for quick local runs, not for published numbers.
+REGION_VARIANTS = 2000  # contiguous block for the `region` workload
+SCATTERED_VARIANTS = 1000  # spread-out lookups for the `scattered` workload
 
 # Skip the full_decode workload when its (variants x samples) f64 output matrix
 # would exceed this; full materialization is not a realistic workload at that
@@ -279,10 +286,16 @@ def _timed_call(fn, proc):
 
 
 def _summarize(times, mems, faults, first):
+    median = statistics.median(times)
     out = {
         "ok": True,
-        "median_time": statistics.median(times),
+        "median_time": median,
         "min_time": min(times),
+        "max_time": max(times),
+        # Spread of the measured runs as a fraction of the median. A speedup
+        # smaller than this is not a result, and recording it means that can be
+        # checked afterwards instead of assumed.
+        "spread": (max(times) - min(times)) / median if median > 0 else None,
         "peak_memory_mb": statistics.median(mems),
     }
     known = [f for f in faults if f is not None]
@@ -517,6 +530,9 @@ def run_remote(bucket, files, num_runs, warmup, max_full_gb=MAX_FULL_GB):
 
 
 def main():
+    # Rebound from the CLI below; declared here because the argparse defaults
+    # read the module-level values first.
+    global REGION_VARIANTS, SCATTERED_VARIANTS
     p = argparse.ArgumentParser(description="lazybgen vs bgen head-to-head benchmark")
     p.add_argument("--data-dir", default="benchmarks/test_data")
     p.add_argument("--output", default="benchmarks/compare_results.json")
@@ -527,6 +543,18 @@ def main():
         "--remote-warmup", type=int, default=0, help="warmup passes for the remote run (default 0: measure cold)"
     )
     p.add_argument("--skip-local", action="store_true")
+    p.add_argument(
+        "--region-variants",
+        type=int,
+        default=REGION_VARIANTS,
+        help=f"variants in the contiguous `region` read (default {REGION_VARIANTS})",
+    )
+    p.add_argument(
+        "--scattered-variants",
+        type=int,
+        default=SCATTERED_VARIANTS,
+        help=f"variants in the spread-out `scattered` read (default {SCATTERED_VARIANTS})",
+    )
     p.add_argument(
         "--max-full-gb",
         type=float,
@@ -566,6 +594,10 @@ def main():
         "local": [],
         "remote": [],
     }
+
+    REGION_VARIANTS = args.region_variants
+    SCATTERED_VARIANTS = args.scattered_variants
+    out["workload_variants"] = {"region": REGION_VARIANTS, "scattered": SCATTERED_VARIANTS}
 
     if not args.skip_local:
         print("=== LOCAL: lazybgen vs bgen ===")

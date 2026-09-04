@@ -12,8 +12,8 @@ Example
     python benchmarks/compare_remote_backends.py \
         --url gs://my-bucket/big.bgen --reps 3
 
-Requires obstore (``pip install lazybgen[obstore]``) for the obstore rows;
-without it the script reports fsspec only.
+obstore is a dependency, so both transports are available out of the box; if it
+has been removed from the environment the script reports fsspec only.
 """
 
 from __future__ import annotations
@@ -122,7 +122,7 @@ def main():
 
     backends = [b for b in BACKENDS if b != "obstore" or is_available()]
     if "obstore" not in backends:
-        print("obstore is not installed; reporting fsspec only (pip install lazybgen[obstore])")
+        print("obstore is unavailable in this process; reporting fsspec only")
 
     rows = variant_rows(args.url, storage_options)
     workloads = build_workloads(rows, args.variants)

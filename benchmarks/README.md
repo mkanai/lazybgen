@@ -36,6 +36,23 @@ we want when optimizing lazybgen.
 
 ## Workloads (per file)
 
+**Remote comparisons must be interleaved.** `--interleave` applies only to the
+local run; the remote run has none, and two remote configurations measured as
+separate runs are not comparable - this link has shown the same read drift by up
+to 7x across a day, which is larger than most of the effects being measured.
+Alternate the configurations rep by rep, warm each shape before timing it, and
+report the spread. Repeated reads of one object are served warm, so warm numbers
+compare fairly with each other but are not cold streaming rates.
+
+The slice workloads read `--region-variants` (default 2000) contiguous variants
+and `--scattered-variants` (default 1000) spread-out ones. These are the ladder's
+constant: a run that changes them is not comparable with one that does not, and
+the published tables below were measured at the older 500 / 200, which is what
+their column headers say. Re-running with the current defaults reproduces the
+ratios, not the wall times. Each result also carries `spread`, the range of the
+measured runs over their median, so a speedup smaller than the noise is visible
+rather than assumed.
+
 | Workload               | What it measures                                           |
 |------------------------|-----------------------------------------------------------|
 | `load_full`            | `load_bgen()` decoding every variant x sample             |
@@ -166,7 +183,7 @@ bucket, median of 3):
 | Scattered (200 random)   | 1.52 s                        |
 
 These are the fsspec (gcsfs) transport, which is now the fallback rather than the
-default. The same reads run 1.2-1.4x faster on obstore, because it does the
+default. The same reads run roughly 1.1-1.5x faster on obstore, because it does the
 HTTP and TLS in Rust
 with the GIL released and several range requests can be genuinely in flight at
 once; see "Remote transports" in the root README, and

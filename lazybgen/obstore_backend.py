@@ -25,10 +25,13 @@ whether a given environment actually has it.
 
 import hashlib
 import json
+import logging
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "ObstoreFileSystem",
@@ -53,6 +56,52 @@ _MIN_RANGES_TO_SPLIT = 4
 
 _pool: Optional[ThreadPoolExecutor] = None
 _pool_lock = threading.Lock()
+
+# obstore drives its requests on a process-global tokio runtime that does NOT
+# survive fork(): a child that inherits a runtime the parent has already used
+# hangs on its first request instead of failing, with no error to diagnose it by.
+# _did_io records whether this process ever reached obstore, and the at-fork hook
+# turns that into "obstore is unusable in this child" so a read can fall back to
+# fsspec rather than deadlock. Clearing our own caches is not enough; the runtime
+# itself is what does not survive.
+_did_io = False
+_broken_by_fork = False
+
+
+def _note_io() -> None:
+    """Record that this process has driven at least one obstore request."""
+    global _did_io
+    _did_io = True
+
+
+def _reset_after_fork() -> None:
+    """Drop everything a forked child cannot inherit safely.
+
+    The pool's worker threads do not exist in the child, and a cached store holds
+    an access token the parent fetched. Neither lock is taken here: a lock held by
+    another thread at fork time is inherited locked, so taking one would deadlock.
+    Both are replaced outright instead.
+    """
+    global _pool, _pool_lock, _store_cache_lock, _broken_by_fork
+    _pool = None
+    _pool_lock = threading.Lock()
+    _store_cache_lock = threading.Lock()
+    _store_cache.clear()
+    if _did_io:
+        _broken_by_fork = True
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_after_fork)
+
+
+def fork_broken() -> bool:
+    """True if obstore cannot be used here because this process was forked.
+
+    The parent had already driven a request, so the tokio runtime this child
+    inherited is dead and any obstore call would hang.
+    """
+    return _broken_by_fork
 
 
 def _thread_count() -> int:
@@ -82,7 +131,9 @@ def _shared_pool() -> ThreadPoolExecutor:
 
 
 def is_available() -> bool:
-    """Return True if the obstore package can be imported."""
+    """Return True if obstore can be imported AND used in this process."""
+    if _broken_by_fork:
+        return False
     try:
         import obstore  # noqa: F401
     except ImportError:
@@ -136,6 +187,47 @@ def _billing_project(options: Dict[str, Any]) -> str:
     )
 
 
+def _load_json_file(path: str) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise UnsupportedStorageOption(f"could not read the credentials at {path!r}: {exc}") from exc
+
+
+def _require_service_account(payload: Any) -> None:
+    """Reject credentials obstore's GCS store cannot use.
+
+    gcsfs also accepts an ``authorized_user`` (gcloud user ADC) document, which
+    obstore's ``service_account`` / ``service_account_key`` settings cannot load.
+    Rejecting it sends the read back to fsspec rather than failing at open.
+    """
+    if not isinstance(payload, dict) or payload.get("type") != "service_account":
+        kind = payload.get("type") if isinstance(payload, dict) else type(payload).__name__
+        raise UnsupportedStorageOption(
+            f"the obstore transport needs a service-account key; got credentials of type {kind!r}"
+        )
+
+
+# gcsfs resolves credentials through google_default -> cache -> cloud -> anon, so
+# on a machine with NO GCP credentials it still reads a public bucket. obstore has
+# no anonymous step: it fails the token request instead. These are the fragments
+# of that failure, used to retry once unsigned and restore the 0.1.0 behavior for
+# the only case where the two transports differ on credentials.
+_MISSING_CREDENTIAL_HINTS = ("token request", "computemetadata", "credential")
+
+# Options that leave the credential choice entirely to the transport. Anything
+# else means the caller named a credential, and a silent anonymous retry would
+# not be what they asked for.
+_CREDENTIAL_FREE_OPTIONS = frozenset({"token", "project"})
+_EXPLICIT_CREDENTIAL_KWARGS = ("service_account", "service_account_key", "skip_signature", "bearer_token")
+
+
+def _looks_like_missing_credentials(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(hint in text for hint in _MISSING_CREDENTIAL_HINTS)
+
+
 def _translate_gcs(options: Dict[str, Any]) -> Dict[str, Any]:
     """Map gcsfs storage_options onto GCSStore keyword arguments."""
     kwargs: Dict[str, Any] = {}
@@ -143,17 +235,35 @@ def _translate_gcs(options: Dict[str, Any]) -> Dict[str, Any]:
 
     for key, value in options.items():
         if key == "anon":
+            # gcsfs has no `anon` parameter: it lands in **kwargs and is silently
+            # discarded, so a gs:// read with anon=True is AUTHENTICATED there.
+            # Mapping it to skip_signature here would quietly send a different
+            # credential than 0.1.0 did, so it is treated as untranslatable and
+            # the read falls back to fsspec. token="anon" is the spelling gcsfs
+            # actually honors, and it is handled below.
             if value:
-                kwargs["skip_signature"] = True
+                raise UnsupportedStorageOption(
+                    "anon is not honored for gs:// by gcsfs, so the obstore transport "
+                    'refuses it rather than reading anonymously; use token="anon" to '
+                    "read a public bucket without credentials"
+                )
         elif key == "token":
-            if value in (None, "google_default", "cloud", "default"):
+            if value in (None, "google_default"):
                 # The default credential chain, which is what obstore already does.
+                # "cloud" and "default" are NOT equivalent and are refused below:
+                # gcsfs's "cloud" is the metadata server ONLY, where obstore's
+                # default chain prefers an ADC file, so the two can read as
+                # different principals; and "default" is not a gcsfs method at
+                # all, so gcsfs signs with the literal string and fails. Making
+                # it work here would hide a bad option instead of surfacing it.
                 continue
             if value == "anon":
                 kwargs["skip_signature"] = True
             elif isinstance(value, str) and os.path.exists(value):
+                _require_service_account(_load_json_file(value))
                 kwargs["service_account"] = value
             elif isinstance(value, dict):
+                _require_service_account(value)
                 kwargs["service_account_key"] = json.dumps(value)
             else:
                 raise UnsupportedStorageOption(f"token={value!r} is not supported by the obstore transport")
@@ -172,6 +282,12 @@ def _translate_gcs(options: Dict[str, Any]) -> Dict[str, Any]:
     if headers:
         kwargs["client_options"] = {"default_headers": headers}
     return kwargs
+
+
+def _conflicts(options: Dict[str, Any], sub_key: str) -> bool:
+    """True if a client_kwargs entry is also set at the top level."""
+    top_level = {"endpoint_url": "endpoint_url", "region_name": "region_name"}[sub_key]
+    return top_level in options
 
 
 def _translate_s3(options: Dict[str, Any]) -> Dict[str, Any]:
@@ -193,12 +309,18 @@ def _translate_s3(options: Dict[str, Any]) -> Dict[str, Any]:
                 kwargs["request_payer"] = True
         elif key == "endpoint_url":
             kwargs["endpoint"] = value
-        elif key == "region_name":
+        elif key == "region_name":  # noqa: SIM114 - kept distinct from client_kwargs below
             kwargs["region"] = value
         elif key == "client_kwargs":
+            if value is None:
+                continue  # s3fs treats a missing client_kwargs and None alike
             if not isinstance(value, dict):
                 raise UnsupportedStorageOption("client_kwargs must be a dict")
             for sub_key, sub_value in value.items():
+                if sub_key in ("endpoint_url", "region_name") and _conflicts(options, sub_key):
+                    # s3fs raises on this pair rather than picking one, so
+                    # resolving it by dict order here would invent a behavior.
+                    raise UnsupportedStorageOption(f"{sub_key!r} is given both at the top level and in client_kwargs")
                 if sub_key == "region_name":
                     kwargs["region"] = sub_value
                 elif sub_key == "endpoint_url":
@@ -209,6 +331,13 @@ def _translate_s3(options: Dict[str, Any]) -> Dict[str, Any]:
                     )
         else:
             raise UnsupportedStorageOption(f"{key!r} is not supported by the obstore transport")
+
+    endpoint = kwargs.get("endpoint")
+    if isinstance(endpoint, str) and endpoint.startswith("http://"):
+        # object_store refuses plain HTTP unless told otherwise, where s3fs allows
+        # it. Local S3 stand-ins (MinIO, localstack) are the reason anyone sets a
+        # plaintext endpoint at all.
+        kwargs["client_options"] = {"allow_http": True}
 
     return kwargs
 
@@ -287,12 +416,22 @@ class ObstoreFileSystem:
 
     def __init__(self, **storage_options: Any):
         self.storage_options = storage_options
+        # Translated once here rather than per _store() call. _store runs on every
+        # fan-out chunk, and for requester_pays=True translation can reach
+        # google.auth.default(), which off GCE shells out to gcloud: a subprocess
+        # per chunk, executed inside the very threads this transport exists to
+        # keep free. Raising here also surfaces a bad option at construction.
+        self._store_kwargs: Dict[str, Dict[str, Any]] = {}
         # Object sizes seen by this instance. The reader asks for the size at
         # open and again when it opens the sequential handle, and a remote HEAD
         # is a full round trip; the file cannot change under an open reader
         # anyway, so one lookup serves both.
         self._sizes: Dict[str, int] = {}
         self._sizes_lock = threading.Lock()
+        # At most one anonymous retry per filesystem (see _call_with_anon_retry),
+        # so a fan-out cannot turn one missing credential into N retries.
+        self._anon_retry_lock = threading.Lock()
+        self._anon_retry_done = False
 
     def _store(self, url: str) -> Tuple[Any, str]:
         """Return (store, key) for a URL, reusing a store built earlier.
@@ -303,7 +442,10 @@ class ObstoreFileSystem:
         instances the same way, which keeps the two transports comparable.
         """
         scheme, bucket, key = split_url(url)
-        kwargs = translate_storage_options(scheme, self.storage_options)
+        kwargs = self._store_kwargs.get(scheme)
+        if kwargs is None:
+            kwargs = translate_storage_options(scheme, self.storage_options)
+            self._store_kwargs[scheme] = kwargs
         cache_key = _store_cache_key(scheme, bucket, kwargs)
         with _store_cache_lock:
             store = _store_cache.get(cache_key)
@@ -311,6 +453,50 @@ class ObstoreFileSystem:
                 store = _build_store(scheme, bucket, kwargs)
                 _store_cache[cache_key] = store
         return store, key
+
+    def _may_retry_anonymously(self, scheme: str) -> bool:
+        """True if an unsigned retry is the right response to a credential failure.
+
+        Only when the caller named no credential of their own and is not paying
+        for the read: a requester-pays fetch is billed to a project and can never
+        be anonymous.
+        """
+        if scheme not in ("gs", "gcs"):
+            return False
+        if self.storage_options.get("requester_pays"):
+            return False
+        if not set(self.storage_options) <= _CREDENTIAL_FREE_OPTIONS:
+            return False
+        if self.storage_options.get("token") not in (None, "google_default"):
+            return False
+        kwargs = self._store_kwargs.get(scheme, {})
+        return not any(name in kwargs for name in _EXPLICIT_CREDENTIAL_KWARGS)
+
+    def _call_with_anon_retry(self, url: str, operation):
+        """Run one obstore call, falling back to an unsigned read once.
+
+        A public bucket read from a machine with no GCP credentials succeeds on
+        gcsfs, whose credential ladder ends at anonymous access. Without this it
+        would fail on obstore, which is a regression for the most basic remote
+        call there is.
+        """
+        try:
+            return operation()
+        except Exception as exc:
+            scheme = split_url(url)[0]
+            with self._anon_retry_lock:
+                if (
+                    self._anon_retry_done
+                    or not self._may_retry_anonymously(scheme)
+                    or not _looks_like_missing_credentials(exc)
+                ):
+                    raise
+                self._anon_retry_done = True
+                kwargs = dict(self._store_kwargs.get(scheme, {}))
+                kwargs["skip_signature"] = True
+                self._store_kwargs[scheme] = kwargs
+                logger.info("No GCP credentials found; reading %s anonymously.", url)
+            return operation()
 
     # --- filesystem surface used by the reader --------------------------------
 
@@ -325,8 +511,16 @@ class ObstoreFileSystem:
         with self._sizes_lock:
             size = self._sizes.get(url)
         if size is None:
-            store, key = self._store(url)
-            size = int(obstore.head(store, key)["size"])
+
+            def head() -> int:
+                store, key = self._store(url)
+                _note_io()
+                return int(obstore.head(store, key)["size"])
+
+            # The reader's first obstore call for a file, so this is where a
+            # missing credential surfaces and where the retry belongs: it runs on
+            # one thread, before any fan-out.
+            size = self._call_with_anon_retry(url, head)
             with self._sizes_lock:
                 self._sizes[url] = size
         return size
@@ -362,6 +556,8 @@ class ObstoreFileSystem:
             by_path.setdefault(path, []).append(index)
 
         results: List[Any] = [None] * count
+
+        _note_io()
 
         def fetch(path: str, indices: Sequence[int]) -> None:
             store, key = self._store(path)
@@ -409,11 +605,17 @@ class ObstoreFileSystem:
         """Write a whole object to a local path."""
         import obstore
 
-        store, key = self._store(url)
-        response = obstore.get(store, key)
-        with open(dest_path, "wb") as handle:
-            for chunk in response.stream():
-                handle.write(chunk)
+        def fetch() -> None:
+            store, key = self._store(url)
+            _note_io()
+            response = obstore.get(store, key)
+            with open(dest_path, "wb") as handle:
+                for chunk in response.stream():
+                    handle.write(chunk)
+
+        # Downloading a remote .bgi is the first obstore call of a whole read, so
+        # it needs the same anonymous fallback as the size lookup.
+        self._call_with_anon_retry(url, fetch)
 
 
 class ObstoreFile:
@@ -472,6 +674,7 @@ class ObstoreFile:
             # block-sized pieces and every piece would miss.
             start = self._pos
             end = min(self._size, start + size + self._block_size)
+            _note_io()
             self._buffer = bytes(obstore.get_range(self._store, self._key, start=start, end=end))
             self._buffer_start = start
 

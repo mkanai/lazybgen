@@ -38,6 +38,14 @@ _PACKAGE_FOR_SCHEME = {"gs": "gcsfs", "s3": "s3fs"}
 REMOTE_BACKENDS = ("auto", "fsspec", "obstore")
 _DEFAULT_REMOTE_BACKEND = "auto"
 
+# Schemes "auto" will hand to obstore. s3:// is deliberately absent: obstore's S3
+# store does not resolve a bucket's region (it assumes us-east-1 and fails with a
+# redirect error elsewhere) and its credential chain skips ~/.aws/credentials,
+# AWS_PROFILE and SSO, all of which s3fs handles. Both would turn working 0.1.0
+# code into an error, and neither is covered by a test we can run, so S3 keeps the
+# transport it has. remote_backend="obstore" still selects it explicitly.
+_OBSTORE_AUTO_SCHEMES = ("gs", "gcs")
+
 
 def is_remote_path(path: str) -> bool:
     """Return True if ``path`` is a cloud URL handled by a remote backend."""
@@ -51,11 +59,12 @@ def resolve_remote_backend(path: str, storage_options: Optional[Dict] = None, ba
     ``"obstore"``); when it is None the ``LAZYBGEN_REMOTE_BACKEND`` environment
     variable is consulted, then the default of ``"auto"``.
 
-    ``"auto"`` chooses obstore only when it is installed AND every entry in
-    ``storage_options`` has an obstore equivalent, so an option that would
-    otherwise be silently dropped (and change which bytes are read) sends the
-    read back to fsspec instead. Asking for ``"obstore"`` explicitly raises
-    rather than falling back.
+    ``"auto"`` chooses obstore only for the schemes in ``_OBSTORE_AUTO_SCHEMES``
+    (``gs://`` today, not ``s3://``), only when obstore is installed and usable in
+    this process, and only when every entry in ``storage_options`` has an obstore
+    equivalent, so an option that would otherwise be silently dropped (and change
+    which bytes are read) sends the read back to fsspec instead. Asking for
+    ``"obstore"`` explicitly raises rather than falling back.
     """
     if backend is None:
         backend = os.environ.get("LAZYBGEN_REMOTE_BACKEND") or _DEFAULT_REMOTE_BACKEND
@@ -69,6 +78,14 @@ def resolve_remote_backend(path: str, storage_options: Optional[Dict] = None, ba
 
     scheme = path.split("://", 1)[0]
     if backend == "obstore":
+        if obstore_backend.fork_broken():
+            raise RuntimeError(
+                "remote_backend='obstore' cannot be used in this process: it was forked "
+                "from a parent that had already read through obstore, and obstore's "
+                "runtime does not survive fork(), so a read here would hang. Use the "
+                "'spawn' or 'forkserver' multiprocessing start method, or "
+                "remote_backend='fsspec'."
+            )
         if not obstore_backend.is_available():
             raise ImportError(
                 "remote_backend='obstore' requires the obstore package, which lazybgen "
@@ -78,6 +95,17 @@ def resolve_remote_backend(path: str, storage_options: Optional[Dict] = None, ba
         obstore_backend.translate_storage_options(scheme, storage_options)
         return "obstore"
 
+    if obstore_backend.fork_broken():
+        # A forked child inherits a dead obstore runtime. Falling back keeps the
+        # read working (slower) where using obstore would hang with no error.
+        logger.warning(
+            "This process was forked after a remote read, so obstore is unusable here "
+            "and the read falls back to fsspec. Use the 'spawn' or 'forkserver' "
+            "multiprocessing start method to keep the faster transport."
+        )
+        return "fsspec"
+    if scheme not in _OBSTORE_AUTO_SCHEMES:
+        return "fsspec"
     return "obstore" if obstore_backend.can_handle(scheme, storage_options) else "fsspec"
 
 

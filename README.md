@@ -61,9 +61,9 @@ load_bgen("gs://bucket/file.bgen", storage_options={"requester_pays": "my-billin
 load_bgen("s3://bucket/file.bgen", storage_options={"anon": True})
 ```
 
-`gs://` and `s3://` reads go through [obstore](https://developmentseed.org/obstore/)
-by default, which is 1.2-1.4x faster than gcsfs / s3fs and needs no code change.
-See [Remote transports](#remote-transports).
+`gs://` reads go through [obstore](https://developmentseed.org/obstore/) by
+default, which is ~1.1-1.5x faster than gcsfs and needs no code change. See
+[Remote transports](#remote-transports).
 
 `load_bgen` returns `(genotypes, variant_info, sample_ids)`, where `genotypes`
 is an `(n_samples, n_variants)` `np.ndarray`, `variant_info` is a `pd.DataFrame`
@@ -130,12 +130,23 @@ was built against (vendored libdeflate / zstd, or system libraries).
 Remote reads go through one of two transports, chosen per reader by
 `remote_backend`:
 
-- **obstore**, installed by default and used by default. It runs HTTP and TLS in
-  Rust with the GIL released, so one process can have many range requests
-  genuinely in flight.
-- **fsspec** (`gcsfs` / `s3fs`), always available, and the fallback. fsspec drives
-  every request in a process through a single asyncio event loop, which pins one
-  CPU core and caps throughput there.
+- **obstore**, installed by default and used by default **for `gs://`**. It runs
+  HTTP and TLS in Rust with the GIL released, so one process can have many range
+  requests genuinely in flight.
+- **fsspec** (`gcsfs` / `s3fs`), always available, the fallback, and still the
+  default for `s3://`. fsspec drives every request in a process through a single
+  asyncio event loop, which pins one CPU core and caps throughput there.
+
+`s3://` stays on s3fs because obstore's S3 store does not resolve a bucket's
+region (it assumes `us-east-1`) and its credential chain does not read
+`~/.aws/credentials`, `AWS_PROFILE` or SSO. Pass `remote_backend="obstore"` to
+use it for S3 anyway, with an explicit region and credentials.
+
+**Multiprocessing**: obstore's runtime does not survive `fork()`, which is the
+default start method on Linux. A process that reads and then forks leaves its
+children unable to use obstore, and they fall back to fsspec automatically rather
+than hanging. Use the `spawn` or `forkserver` start method if you want workers to
+keep the faster transport.
 
 `remote_backend="auto"` (the default) uses obstore when it is importable **and**
 every entry in `storage_options` has an obstore equivalent, and falls back to
@@ -150,19 +161,24 @@ range batch is split across is `LAZYBGEN_OBSTORE_THREADS` (default 16).
 transport translates them. Requester-pays works on both: GCS by way of the
 `x-goog-user-project` header, S3 by way of the native request-payer setting.
 
-Measured on a same-region GCS bucket from a `us-central1` VM, reading 500 variants
-(median of 3, both transports verified byte-identical):
+Measured on a same-region GCS bucket from a `us-central1` VM (fsspec -> obstore,
+same reader, both verified byte-identical):
 
-| Read | 100k samples (801 MB file) | 500k samples (4.9 GB file) |
+| Read (500k samples, 9.1 GB file) | fsspec | obstore |
 |---|---|---|
-| Region (500 contiguous) | 1081 -> 759 ms (**1.42x**) | 2614 -> 2042 ms (**1.28x**) |
-| Scattered (500 spread)  | 1168 -> 918 ms (**1.27x**) | 2645 -> 1851 ms (**1.43x**) |
-| One variant             | 156 -> 129 ms (**1.21x**)  | 311 -> 255 ms (**1.22x**)  |
+| Region (500 contiguous) | 2.98 s | **2.79 s** (1.07x) |
+| Scattered (500 spread)  | 1.49 s | **1.26 s** (1.18x) |
+| One variant             | 503 ms | **345 ms** (1.46x) |
+| Full decode             | 53.7 s | **46.1 s** (1.16x) |
 
 The fetch itself is 2.5x (contiguous) to 3.8x (scattered) faster; the end-to-end
 figure is smaller because roughly half of a remote read is decoding and
-allocating the output, which the transport does not touch. `benchmarks/compare_remote_backends.py`
-runs this comparison against your own bucket.
+allocating the output, which the transport does not touch. The spread across
+workloads and machines is wide (a second run on a smaller file put every read
+between 1.2x and 1.4x, and one scattered read came out slightly below 1.0), so
+treat these as "somewhat faster, never slower in aggregate" rather than a
+constant. `benchmarks/compare_remote_backends.py` runs the comparison against
+your own bucket.
 
 ### Remote `.bgi` index caching
 
@@ -222,15 +238,15 @@ with BgenReader("chr1.bgen", num_threads=8) as reader:
 ## Performance
 
 lazybgen vs the [`bgen`](https://pypi.org/project/bgen/) package reading the same
-local files (16 vCPU / 125 GB n2 VM, median of 3 page-cache-warm runs, 2026-09-03).
+local files (16 vCPU / 125 GB n2 VM, median of 3 page-cache-warm runs, 2026-09-04).
 Variant count fixed at 10k, samples scaling to biobank size; speedup is lazybgen
 vs bgen, parenthetical is lazybgen's wall time:
 
 | Workload                 | 5k x 10k (94 MB) | 50k x 10k (931 MB) | 500k x 10k (9.1 GB) |
 |--------------------------|------------------|--------------------|---------------------|
-| Full decode              | 10.6x (75 ms)    | 15.5x (471 ms)     | 15.6x (4.77 s)      |
-| Region (500 variants)    | 7.9x (5 ms)      | 13.3x (30 ms)      | 15.8x (257 ms)      |
-| Scattered (200 variants) | 4.5x (4 ms)      | 10.4x (16 ms)      | 14.4x (114 ms)      |
+| Full decode              | 9.0x (97 ms)     | 14.4x (578 ms)     | 14.4x (5.37 s)      |
+| Region (500 variants)    | 7.1x (6 ms)      | 13.5x (35 ms)      | 13.7x (286 ms)      |
+| Scattered (200 variants) | 4.2x (5 ms)      | 9.4x (21 ms)       | 13.7x (127 ms)      |
 
 A local file is memory-mapped and read in place, so the compressed bytes are never
 copied into a buffer on the way. What a read costs in memory is then essentially
@@ -255,9 +271,9 @@ time stays flat while the download baseline grows. At 500k samples:
 
 | Read (500k samples)      | lazybgen `gs://` | 10k var (9.1 GB) | 50k var (45 GB) | 100k var (91 GB) |
 |--------------------------|------------------|------------------|-----------------|------------------|
-| One variant              | **433 ms**       | ~14x (6 s)       | ~64x (28 s)     | ~130x (56 s)     |
-| Region (500 contiguous)  | **2.34 s**       | ~4x (10 s)       | ~14x (32 s)     | ~26x (60 s)      |
-| Scattered (200 random)   | **1.26 s**       | ~6x (8 s)        | ~23x (29 s)     | ~46x (58 s)      |
+| One variant              | **345 ms**       | ~31x (10.6 s)    | ~152x (52 s)    | ~305x (105 s)    |
+| Region (500 contiguous)  | **2.79 s**       | ~4x (10.6 s)     | ~19x (52 s)     | ~38x (105 s)     |
+| Scattered (200 random)   | **1.26 s**       | ~8x (10.6 s)     | ~41x (52 s)     | ~83x (105 s)     |
 
 The numbers above are for the fsspec transport. With **pure-Python** transports,
 remote throughput is bounded per process and not by the link: the limit is one CPU
@@ -268,16 +284,19 @@ on several threads is *worse*, not better, since they contend for one GIL.
 
 The default obstore transport lifts that: it does the HTTP and TLS in Rust with
 the GIL released, which takes a byte-range fetch from ~350 MB/s to ~1 GB/s in one
-process and the reads above to 1.2-1.4x (see
-[Remote transports](#remote-transports)). Beyond that, shard the variants across
-**processes**; threads on a pure-Python transport will not do it.
+process. End to end that is worth roughly 1.1-1.5x on the reads above, since about
+half of a remote read is decoding and allocating the output rather than moving
+bytes (see [Remote transports](#remote-transports)). Beyond that, shard the
+variants across **processes**; threads on a pure-Python transport will not do it.
 
 Each cell is the end-to-end speedup, with the download-then-read baseline time in
 parentheses (whole-file `gcloud storage cp` + bgen's local read). Both halves are
-measured same-region: the 9.1 GB download ran five times at 8.4 to 10.0 s, median
-6.01 s or 1.62 GB/s, and the larger sizes scale from that rate. Download speed is
-machine-dependent: the same measurement on a smaller VM gave 1.06 GB/s, so treat
-the ratios as being for this class of host. This is
+measured same-region and in the same run: the 9.1 GB download ran five times at
+7.6 / 8.8 / 10.6 / 11.9 / 18.2 s, median 10.6 s or 0.86 GB/s, and the larger sizes
+scale from that rate. Download speed is machine-dependent and not very
+repeatable - the same measurement gave 1.62 GB/s on an identical VM a day earlier
+and 1.06 GB/s on the dev box - so treat the ratios as being for this class of
+host, not as constants. This is
 **best-case for the download** (fast same-region link, free egress), so a
 laptop/cross-region/metered link widens every gap. See
 [benchmarks/README.md](benchmarks/README.md#lazybgen-vs-the-bgen-package) for the

@@ -94,9 +94,11 @@ cdef class BgenReader:
         remote_backend : str, optional
             Transport for gs:// and s3:// reads: "obstore", "fsspec" (gcsfs /
             s3fs), or "auto". "auto" (the default, overridable with the
-            LAZYBGEN_REMOTE_BACKEND environment variable) uses obstore when it is
-            installed and can express every storage_options entry, and fsspec
-            otherwise. obstore moves several times more bytes per second per
+            LAZYBGEN_REMOTE_BACKEND environment variable) uses obstore for gs://
+            when it is installed, usable in this process, and can express every
+            storage_options entry, and fsspec otherwise; s3:// stays on s3fs
+            unless "obstore" is asked for explicitly. obstore moves several times
+            more bytes per second per
             process, because it runs HTTP and TLS outside the GIL rather than
             through fsspec's single event loop. Ignored for local files.
         """
@@ -105,9 +107,15 @@ cdef class BgenReader:
         self.storage_options = storage_options
         # Resolved once here rather than per read, so every path of one reader
         # (index download, header parse, genotype fetch) uses the same transport.
+        # Resolve against whichever path is actually remote: a local BGEN with a
+        # remote .bgi would otherwise hand a filesystem path to the scheme parser.
+        _remote_path = (
+            file_path if is_remote_path(file_path)
+            else (self.bgi_path if is_remote_path(self.bgi_path) else None)
+        )
         self.remote_backend = (
-            resolve_remote_backend(file_path, storage_options, remote_backend)
-            if is_remote_path(file_path) or is_remote_path(self.bgi_path)
+            resolve_remote_backend(_remote_path, storage_options, remote_backend)
+            if _remote_path is not None
             else 'fsspec'
         )
         self.is_open = False

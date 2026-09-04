@@ -71,7 +71,11 @@ def stand_in_obstore(monkeypatch):
     module, store_module = _make_stand_in_obstore(payload, calls)
     monkeypatch.setitem(sys.modules, "obstore", module)
     monkeypatch.setitem(sys.modules, "obstore.store", store_module)
+    # The store cache lives for the process, so a stand-in store left in it would
+    # be served to a later test that asked for the same bucket.
+    obstore_backend.clear_store_cache()
     yield calls
+    obstore_backend.clear_store_cache()
 
 
 def _open_remote(**kwargs):

@@ -14,10 +14,16 @@ def test_s3_path_skips_local_existence_guard():
     # Force a deterministic, network-free failure by making the s3fs import fail
     # (None in sys.modules => ImportError). The error must come from the backend
     # layer ("Failed to import s3fs ..."), never "BGEN file not found".
+    # Pinned to fsspec: nulling s3fs only forces a failure on that transport, and
+    # an unpinned reader would instead make real requests through obstore.
     local_bgi = os.path.join(DATA, "data.bgen.bgi")
     with patch.dict("sys.modules", {"s3fs": None}):
         with pytest.raises(Exception) as exc:
-            BgenReader("s3://lazybgen-no-such-bucket-xyz/data.bgen", bgi_path=local_bgi)
+            BgenReader(
+                "s3://lazybgen-no-such-bucket-xyz/data.bgen",
+                bgi_path=local_bgi,
+                remote_backend="fsspec",
+            )
     assert "BGEN file not found" not in str(exc.value)
 
 

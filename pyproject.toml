@@ -14,7 +14,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lazybgen"
-version = "0.1.0"
+version = "0.2.0"
 description = "High-performance BGEN reader with cloud (GCS/S3) partial-read support"
 readme = "README.md"
 authors = [
@@ -45,19 +45,22 @@ dependencies = [
     "gcsfs>=0.7.0",
     "fsspec>=2021.0.0",
     "tqdm>=4.50.0",
+    # 0.9.1 is a hard floor, not a preference: `get_ranges` gained the `coalesce`
+    # keyword there, and the reader passes it on every batched read, so on an
+    # earlier obstore every remote read would raise TypeError.
     # Default remote transport: HTTP and TLS in Rust with the GIL released, so a
     # batch of byte ranges genuinely overlaps instead of queueing behind fsspec's
     # single event loop. gcsfs/fsspec stay required, because they serve any
     # storage_options obstore cannot express and remain the fallback if obstore
     # is deselected at install time.
-    "obstore>=0.7.0",
+    "obstore>=0.9.1",
 ]
 
 [project.optional-dependencies]
 s3 = ["s3fs>=2021.0.0"]
-# obstore is a default dependency; this extra is kept so an existing
-# `pip install lazybgen[obstore]` keeps working.
-obstore = ["obstore>=0.7.0"]
+# obstore is a default dependency. The extra is an alias, so `lazybgen[obstore]`
+# installs the same thing rather than failing.
+obstore = ["obstore>=0.9.1"]
 dev = [
     "pytest>=6.0.0",
     "black>=25.11.0",

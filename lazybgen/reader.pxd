@@ -187,7 +187,7 @@ cdef class BgenReader:
     cdef str sample_path
     cdef object dosage_stats
     cdef object storage_options
-    cdef public str remote_backend
+    cdef readonly str remote_backend
 
     # Private methods
     cdef void _init_reader(self) except *

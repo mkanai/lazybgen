@@ -174,9 +174,10 @@ def load_bgen(
     remote_backend : str, optional
         Transport for gs:// and s3:// reads: "obstore", "fsspec" (gcsfs / s3fs),
         or "auto". "auto" (the default, overridable with the
-        LAZYBGEN_REMOTE_BACKEND environment variable) uses obstore when it is
-        installed and can express every storage_options entry, and fsspec
-        otherwise. Ignored for local files.
+        LAZYBGEN_REMOTE_BACKEND environment variable) uses obstore for gs:// when
+        it is installed, usable in this process, and can express every
+        storage_options entry, and fsspec otherwise; s3:// stays on s3fs unless
+        "obstore" is asked for explicitly. Ignored for local files.
 
     Returns
     -------

@@ -510,3 +510,59 @@ class TestGCSRequesterPays:
             via_obstore, _, _ = load_bgen(url, nan_action="warn", storage_options=options, remote_backend="obstore")
         np.testing.assert_array_equal(np.isnan(via_obstore), np.isnan(via_fsspec))
         np.testing.assert_array_equal(via_obstore[~np.isnan(via_obstore)], via_fsspec[~np.isnan(via_fsspec)])
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not __import__("lazybgen.obstore_backend", fromlist=["is_available"]).is_available(),
+    reason="obstore not installed",
+)
+def test_a_forked_child_still_reads_after_an_obstore_read():
+    """A read in a forked child must not hang, whatever the parent used.
+
+    obstore drives its requests on a tokio runtime that does not survive fork(),
+    and a child that inherits a used one blocks forever rather than failing. That
+    matters because sharding a workload across processes is the documented way to
+    get more remote bandwidth, and `fork` is the default start method on Linux.
+    The reader detects the situation and falls back to fsspec; this test is the
+    guard, and it fails by timing out if the fallback ever stops working.
+    """
+    import os
+    import time
+
+    url = f"{GCS_DATA}/example.16bits.bgen"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        load_bgen(url, nan_action="warn", remote_backend="obstore")
+
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - runs only in the child
+        os.close(read_fd)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                load_bgen(url, nan_action="warn")  # "auto": must fall back, not hang
+            os.write(write_fd, b"ok")
+            os._exit(0)
+        except BaseException:
+            os._exit(1)
+
+    os.close(write_fd)
+    deadline = time.time() + 60
+    exit_code = None
+    while time.time() < deadline:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            exit_code = os.waitstatus_to_exitcode(status)
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+        os.close(read_fd)
+        pytest.fail("the forked child hung: the obstore-after-fork fallback is not working")
+
+    payload = os.read(read_fd, 2)
+    os.close(read_fd)
+    assert exit_code == 0 and payload == b"ok"

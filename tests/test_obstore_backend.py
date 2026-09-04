@@ -43,10 +43,19 @@ def test_gcs_no_options_is_empty():
     assert translate_storage_options("gs", {}) == {}
 
 
-def test_gcs_anon_maps_to_skip_signature():
-    assert translate_storage_options("gs", {"anon": True}) == {"skip_signature": True}
-    # A false flag is the default behavior, so it adds nothing.
+def test_gcs_anon_is_refused_because_gcsfs_ignores_it():
+    # gcsfs has no `anon` parameter: it lands in **kwargs and is discarded, so a
+    # gs:// read with anon=True is AUTHENTICATED there. Honoring it here would
+    # send different credentials than the fsspec transport does for the same
+    # options, so it is refused and the read falls back.
+    with pytest.raises(UnsupportedStorageOption, match="anon"):
+        translate_storage_options("gs", {"anon": True})
+    # A false flag asks for nothing and is not a divergence.
     assert translate_storage_options("gs", {"anon": False}) == {}
+
+
+def test_gcs_anon_sends_the_read_to_fsspec():
+    assert resolve_remote_backend("gs://b/k.bgen", {"anon": True}, "auto") == "fsspec"
 
 
 def test_gcs_requester_pays_string_sets_the_billing_header():
@@ -72,8 +81,19 @@ def test_gcs_project_alone_adds_no_header():
 
 
 def test_gcs_token_default_values_are_the_default_chain():
-    for token in (None, "google_default", "cloud", "default"):
+    for token in (None, "google_default"):
         assert translate_storage_options("gs", {"token": token}) == {}
+
+
+def test_gcs_token_cloud_and_default_are_refused():
+    # gcsfs's "cloud" is the metadata server ONLY, while obstore's default chain
+    # prefers an ADC file, so treating them as equivalent can read as a different
+    # principal. "default" is not a gcsfs method at all: gcsfs signs with the
+    # literal string and fails, so making it work here would hide a bad option.
+    for token in ("cloud", "default"):
+        with pytest.raises(UnsupportedStorageOption, match="token"):
+            translate_storage_options("gs", {"token": token})
+        assert resolve_remote_backend("gs://b/k.bgen", {"token": token}, "auto") == "fsspec"
 
 
 def test_gcs_token_anon_maps_to_skip_signature():
@@ -81,7 +101,7 @@ def test_gcs_token_anon_maps_to_skip_signature():
 
 
 def test_gcs_token_dict_becomes_a_service_account_key():
-    key = {"type": "service_account", "project_id": "p"}
+    key = {"type": "service_account", "project_id": "p", "private_key": "x"}
     got = translate_storage_options("gs", {"token": key})
     assert "service_account_key" in got
     assert '"project_id": "p"' in got["service_account_key"]
@@ -89,14 +109,41 @@ def test_gcs_token_dict_becomes_a_service_account_key():
 
 def test_gcs_token_path_becomes_a_service_account_file(tmp_path):
     key_file = tmp_path / "sa.json"
-    key_file.write_text("{}")
+    key_file.write_text('{"type": "service_account", "private_key": "x"}')
     got = translate_storage_options("gs", {"token": str(key_file)})
     assert got == {"service_account": str(key_file)}
+
+
+def test_gcs_token_rejects_credentials_obstore_cannot_load(tmp_path):
+    # gcsfs also accepts a gcloud user ADC document; obstore's store cannot load
+    # one, so it must be refused here rather than failing later at open.
+    adc = tmp_path / "adc.json"
+    adc.write_text('{"type": "authorized_user", "refresh_token": "x"}')
+    with pytest.raises(UnsupportedStorageOption, match="service-account"):
+        translate_storage_options("gs", {"token": str(adc)})
+    with pytest.raises(UnsupportedStorageOption, match="service-account"):
+        translate_storage_options("gs", {"token": {"type": "authorized_user"}})
 
 
 def test_gcs_unknown_option_is_rejected_by_name():
     with pytest.raises(UnsupportedStorageOption, match="some_future_option"):
         translate_storage_options("gs", {"some_future_option": 1})
+
+
+def test_s3_plain_http_endpoint_allows_http():
+    # object_store refuses http:// unless told; s3fs allows it, and a plaintext
+    # endpoint is how local S3 stand-ins (MinIO, localstack) are addressed.
+    got = translate_storage_options("s3", {"endpoint_url": "http://localhost:9000"})
+    assert got == {"endpoint": "http://localhost:9000", "client_options": {"allow_http": True}}
+    https = translate_storage_options("s3", {"endpoint_url": "https://example.com"})
+    assert "client_options" not in https
+
+
+def test_s3_is_not_auto_selected_for_obstore():
+    # obstore's S3 store does not resolve a bucket's region and skips the
+    # file/profile credential chain s3fs handles, so "auto" leaves S3 on fsspec.
+    assert resolve_remote_backend("s3://b/k.bgen", None, "auto") == "fsspec"
+    assert resolve_remote_backend("s3://b/k.bgen", {"anon": True}, "auto") == "fsspec"
 
 
 def test_s3_credentials_and_flags():
@@ -168,7 +215,8 @@ def test_explicit_argument_beats_the_environment_variable(monkeypatch):
 
 @requires_obstore
 def test_auto_prefers_obstore_when_it_is_installed_and_options_translate():
-    assert resolve_remote_backend("gs://b/k.bgen", {"anon": True}, "auto") == "obstore"
+    assert resolve_remote_backend("gs://b/k.bgen", {"token": "anon"}, "auto") == "obstore"
+    assert resolve_remote_backend("gs://b/k.bgen", None, "auto") == "obstore"
 
 
 # --- filesystem surface -------------------------------------------------------
@@ -193,6 +241,78 @@ def test_cat_ranges_of_nothing_is_nothing():
     assert obstore_backend.ObstoreFileSystem().cat_ranges([], [], []) == []
 
 
+# --- anonymous fallback -------------------------------------------------------
+
+
+class _CredentialError(Exception):
+    pass
+
+
+def _missing_credentials():
+    return _CredentialError(
+        "Generic GCS error: Error performing token request: Error performing GET "
+        "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token"
+    )
+
+
+def test_a_credential_failure_retries_unsigned_once():
+    """gcsfs's ladder ends at anonymous, so a public bucket reads with no creds."""
+    fs = obstore_backend.ObstoreFileSystem()
+    calls = []
+
+    def operation():
+        calls.append(dict(fs._store_kwargs.get("gs", {})))
+        if len(calls) == 1:
+            raise _missing_credentials()
+        return "read"
+
+    assert fs._call_with_anon_retry("gs://bucket/key", operation) == "read"
+    assert len(calls) == 2
+    assert fs._store_kwargs["gs"]["skip_signature"] is True
+
+
+def test_the_anonymous_retry_happens_at_most_once():
+    fs = obstore_backend.ObstoreFileSystem()
+
+    def always_fails():
+        raise _missing_credentials()
+
+    with pytest.raises(_CredentialError):
+        fs._call_with_anon_retry("gs://bucket/key", always_fails)
+    # A second failure must propagate rather than retry again.
+    with pytest.raises(_CredentialError):
+        fs._call_with_anon_retry("gs://bucket/key", always_fails)
+
+
+def test_a_requester_pays_read_is_never_retried_anonymously():
+    # The read is billed to a project, so an unsigned retry cannot be what the
+    # caller wanted.
+    fs = obstore_backend.ObstoreFileSystem(requester_pays="billed-project")
+    with pytest.raises(_CredentialError):
+        fs._call_with_anon_retry("gs://bucket/key", lambda: (_ for _ in ()).throw(_missing_credentials()))
+    assert "skip_signature" not in fs._store_kwargs.get("gs", {})
+
+
+def test_an_explicit_credential_is_never_retried_anonymously(tmp_path):
+    key_file = tmp_path / "sa.json"
+    key_file.write_text('{"type": "service_account", "private_key": "x"}')
+    fs = obstore_backend.ObstoreFileSystem(token=str(key_file))
+    fs._store_kwargs["gs"] = translate_storage_options("gs", fs.storage_options)
+    with pytest.raises(_CredentialError):
+        fs._call_with_anon_retry("gs://bucket/key", lambda: (_ for _ in ()).throw(_missing_credentials()))
+
+
+def test_an_unrelated_error_is_not_retried():
+    fs = obstore_backend.ObstoreFileSystem()
+
+    def boom():
+        raise _CredentialError("404 Not Found")
+
+    with pytest.raises(_CredentialError, match="404"):
+        fs._call_with_anon_retry("gs://bucket/key", boom)
+    assert "skip_signature" not in fs._store_kwargs.get("gs", {})
+
+
 def test_thread_count_honors_the_environment(monkeypatch):
     monkeypatch.setenv("LAZYBGEN_OBSTORE_THREADS", "3")
     assert obstore_backend._thread_count() == 3
@@ -206,12 +326,50 @@ def test_thread_count_honors_the_environment(monkeypatch):
 
 
 def test_module_is_importable_without_obstore(monkeypatch):
-    # The package must import and select a transport on a machine that has never
-    # heard of obstore, which is the default install.
+    # The package must still import and select a transport in an environment
+    # where obstore is absent, even though it is a declared dependency.
     monkeypatch.setattr(obstore_backend, "is_available", lambda: False)
     assert resolve_remote_backend("gs://b/k.bgen", None, "auto") == "fsspec"
     with pytest.raises(ImportError, match="pip install obstore"):
         resolve_remote_backend("gs://b/k.bgen", None, "obstore")
+
+
+@pytest.fixture
+def _forked_after_use(monkeypatch):
+    """Put the module in the state a fork leaves it in after a parent read."""
+    monkeypatch.setattr(obstore_backend, "_did_io", True)
+    obstore_backend._reset_after_fork()
+    yield
+    # Assigned directly, not through monkeypatch: a setattr made during teardown
+    # would itself be undone, leaving the flag set for every later test.
+    obstore_backend._broken_by_fork = False
+
+
+def test_auto_falls_back_to_fsspec_in_a_forked_child(_forked_after_use):
+    # obstore's runtime does not survive fork(); a read on it would hang rather
+    # than fail, so the child must be sent to fsspec.
+    assert obstore_backend.fork_broken() is True
+    assert obstore_backend.is_available() is False
+    assert resolve_remote_backend("gs://b/k.bgen", None, "auto") == "fsspec"
+
+
+def test_explicit_obstore_in_a_forked_child_raises_rather_than_hanging(_forked_after_use):
+    with pytest.raises(RuntimeError, match="fork"):
+        resolve_remote_backend("gs://b/k.bgen", None, "obstore")
+
+
+def test_the_fork_hook_drops_state_the_child_cannot_inherit(_forked_after_use):
+    # The pool's threads do not exist in the child and a cached store holds the
+    # parent's token, so both must be gone.
+    assert obstore_backend._pool is None
+    assert obstore_backend._store_cache == {}
+
+
+def test_a_fork_before_any_read_leaves_obstore_usable(monkeypatch):
+    monkeypatch.setattr(obstore_backend, "_did_io", False)
+    monkeypatch.setattr(obstore_backend, "_broken_by_fork", False)
+    obstore_backend._reset_after_fork()
+    assert obstore_backend.fork_broken() is False
 
 
 def test_environment_is_not_leaked_between_tests():

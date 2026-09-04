@@ -102,8 +102,14 @@ void FsspecFileReader::initialize_python() {
 
     fs_module_ = PyImport_ImportModule(backend.module);
     if (!fs_module_) {
-        throw std::runtime_error(std::string("Failed to import ") + backend.module +
-                                 " module. Please install: pip install " + backend.module);
+        // The obstore adapter ships with lazybgen, so only the fsspec backends are
+        // something the user can install; naming the module to pip-install would be
+        // nonsense for the other one.
+        std::string detail = transport_ == "obstore"
+                                 ? std::string(". This is an internal module and should "
+                                               "always be importable")
+                                 : std::string(". Please install: pip install ") + backend.module;
+        throw std::runtime_error(std::string("Failed to import ") + backend.module + detail);
     }
 
     PyObject* fs_class = PyObject_GetAttrString(fs_module_, backend.class_name);
