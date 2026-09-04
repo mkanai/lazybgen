@@ -80,7 +80,13 @@ cdef class BgenReader:
         self.bgi_path = bgi_path or (file_path + '.bgi')
         self.storage_options = storage_options
         self.is_open = False
-        self.sample_ids = []
+        self.sample_path = sample_path
+        # Sample IDs are materialized on first access (see the `samples`
+        # property). At biobank scale building them is hundreds of thousands of
+        # Python strings, which a read that never asks for sample IDs should not
+        # pay for. None means "not built yet"; an empty list is a real answer.
+        self.sample_ids = None
+        self.dosage_stats = None
 
         # Check files exist (skip for remote paths as they'll be handled by C++)
         if not is_remote_path(self.file_path):
@@ -107,11 +113,12 @@ cdef class BgenReader:
         decompressor_type = 'sequential' if num_threads == 1 else 'parallel'
         self.set_decompressor_type(decompressor_type, num_threads)
         
-        # Load samples
+        # Check the .sample file up front so a missing or truncated one is
+        # reported when the reader is opened, not on some later attribute access.
+        # Only the two mandated header lines are read here; the per-sample rows
+        # are parsed on demand.
         if sample_path:
-            self._load_samples_from_file(sample_path)
-        else:
-            self._load_samples_from_bgen()
+            self._check_sample_file(sample_path)
     
     cdef void _init_reader(self) except *:
         """Initialize C++ reader components."""
@@ -143,31 +150,55 @@ cdef class BgenReader:
         except Exception as e:
             raise RuntimeError(f"Failed to initialize BGEN reader: {e}")
     
+    def _check_sample_file(self, sample_path: str):
+        """Validate a .sample file's header without parsing its rows.
+
+        The .sample format mandates two header lines (column names, then column
+        types) before the per-sample rows. Reading just those two makes a missing
+        or truncated file fail at open, while leaving the per-sample rows (which
+        dominate the cost at biobank scale) to _load_samples_from_file.
+        """
+        with open(sample_path, 'r') as f:
+            if not f.readline() or not f.readline():
+                raise ValueError(
+                    f"Malformed .sample file (expected at least 2 header lines): {sample_path}"
+                )
+
     def _load_samples_from_file(self, sample_path: str):
         """Load sample IDs from .sample file."""
         with open(sample_path, 'r') as f:
-            lines = f.readlines()
+            # Skip the two header lines validated at open.
+            if not f.readline() or not f.readline():
+                raise ValueError(
+                    f"Malformed .sample file (expected at least 2 header lines): {sample_path}"
+                )
+            # Column 2 (ID_2) is the primary ID. split(None, 2) stops after the
+            # field we want instead of splitting every remaining column, and it
+            # already ignores surrounding whitespace, so no separate strip() is
+            # needed. A row without at least two fields carries no ID.
+            self.sample_ids = [
+                parts[1]
+                for parts in (line.split(None, 2) for line in f)
+                if len(parts) >= 2
+            ]
 
-        # The .sample format mandates two header lines (column names, then column
-        # types) before the per-sample rows. Fail loudly on a truncated file
-        # rather than letting a bare StopIteration surface.
-        if len(lines) < 2:
-            raise ValueError(
-                f"Malformed .sample file (expected at least 2 header lines): {sample_path}"
-            )
+    cdef void _load_samples(self) except *:
+        """Materialize the sample IDs from whichever source was configured."""
+        if self.sample_path:
+            self._load_samples_from_file(self.sample_path)
+        else:
+            self._load_samples_from_bgen()
 
-        # Read sample IDs from the rows after the two header lines.
-        self.sample_ids = []
-        for line in lines[2:]:
-            parts = line.strip().split()
-            if len(parts) >= 2:
-                # Use second column (ID_2) as primary ID
-                self.sample_ids.append(parts[1])
-    
     cdef void _load_samples_from_bgen(self) except *:
         """Load sample IDs from BGEN file."""
-        cdef vector[string] cpp_samples = self.impl.get().sample_ids()
-        self.sample_ids = [s.decode('utf-8') for s in cpp_samples]
+        # Bound by reference: copying the C++ vector would duplicate every string
+        # before any of them reach Python.
+        cdef const vector[string]* cpp_samples = &self.impl.get().sample_ids()
+        cdef size_t i
+        cdef list out = []
+        for i in range(cpp_samples.size()):
+            out.append(cpp_samples.at(i).decode('utf-8'))
+        self.sample_ids = out
     
     def set_decompressor_type(self, decompressor_type: str, num_threads: int = 0):
         """
@@ -506,6 +537,9 @@ cdef class BgenReader:
         progress_callback
     ):
         """Load variant dosages from metadata."""
+        # Cleared up front so a decode path that gathers no stats reports None
+        # rather than an answer left over from a previous load.
+        self.dosage_stats = None
         cdef int n_variants = variant_metadata.size()
         if n_variants == 0:
             n_samples = len(sample_indices) if sample_indices is not None else self.header_info.n_samples
@@ -564,6 +598,13 @@ cdef class BgenReader:
         cdef size_t num_threads, out_stride, chunk_bytes
         cdef int chunk_start, chunk_end, chunk_n_variants, n_indices
         cdef const int* si_ptr = NULL
+        # Range / missing-call summary, folded across chunks. The block decode
+        # gathers it while each column is still in cache, which is what lets
+        # load_bgen validate the result without scanning the whole matrix again.
+        cdef const DosageStats* chunk_stats
+        cdef double stats_min = float('inf')
+        cdef double stats_max = float('-inf')
+        cdef bint stats_has_nan = False
         # Cap on compressed bytes held in memory per parallel chunk. The C++ path
         # reads a whole chunk's compressed bytes up front (on this thread) before
         # the parallel inflate+decode, so chunking keeps peak memory bounded
@@ -609,9 +650,19 @@ cdef class BgenReader:
                         self.impl.get().read_decode_block_filtered_parallel(
                             &variant_metadata[chunk_start], <size_t>chunk_n_variants, si_ptr, n_indices,
                             &f64_out[0, chunk_start], out_stride, num_threads)
+                chunk_stats = &self.impl.get().last_block_stats()
+                if chunk_stats.min_value < stats_min:
+                    stats_min = chunk_stats.min_value
+                if chunk_stats.max_value > stats_max:
+                    stats_max = chunk_stats.max_value
+                if chunk_stats.has_nan:
+                    stats_has_nan = True
                 if progress_callback is not None:
                     progress_callback(chunk_end)
                 chunk_start = chunk_end
+            # `bool` here is the C++ type from the .pxd, so build the Python
+            # bool explicitly.
+            self.dosage_stats = (stats_min, stats_max, True if stats_has_nan else False)
             variant_info = self._build_variant_info_frame(variant_metadata)
             return dosages, variant_info
 
@@ -816,8 +867,24 @@ cdef class BgenReader:
         return self.header_info.n_variants
     
     @property
+    def last_dosage_stats(self):
+        """Summary of the values the most recent decode wrote, or None.
+
+        Returns ``(min, max, has_nan)``, where min and max ignore missing calls
+        (so an all-missing result reports ``inf`` and ``-inf``) and has_nan says
+        whether any missing call was written. The block decode collects this as
+        it goes, at no meaningful cost, which saves callers a second pass over
+        the result. It is None when the decode ran through the per-variant
+        serial loop, which does not collect it; callers that need the answer
+        must then compute it from the returned array.
+        """
+        return self.dosage_stats
+
+    @property
     def samples(self) -> List[str]:
-        """List of sample IDs."""
+        """List of sample IDs (materialized on first access, then cached)."""
+        if self.sample_ids is None:
+            self._load_samples()
         return self.sample_ids
     
     @property
@@ -851,7 +918,7 @@ cdef class BgenReader:
         Tuple[List[int], List[str]]
             (indices, found_sample_ids)
         """
-        sample_map = {sid: i for i, sid in enumerate(self.sample_ids)}
+        sample_map = {sid: i for i, sid in enumerate(self.samples)}
         indices = []
         found_ids = []
         

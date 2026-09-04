@@ -128,6 +128,11 @@ cdef extern from "format/genotype_parser.h" namespace "lazybgen::bgen":
 
 # Main BGEN reader class
 cdef extern from "bgen_reader_impl.h" namespace "lazybgen::io::bgen":
+    cdef struct DosageStats:
+        double min_value
+        double max_value
+        bool has_nan
+
     cdef cppclass BgenReaderImpl:
         BgenReaderImpl(const string& filename, const string& bgi_filename, object storage_options) except +
         
@@ -135,7 +140,8 @@ cdef extern from "bgen_reader_impl.h" namespace "lazybgen::io::bgen":
         const BgenHeader& header() except +
 
         # Sample access
-        vector[string] sample_ids() except +
+        const vector[string]& sample_ids() except +
+        const DosageStats& last_block_stats() except +
 
         # Variant access
         vector[VariantMetadata] build_metadata_from_index(const VariantInfo* infos, size_t n) except +
@@ -177,10 +183,13 @@ cdef class BgenReader:
     cdef bool is_open
     cdef str file_path
     cdef str bgi_path
+    cdef str sample_path
+    cdef object dosage_stats
     cdef object storage_options
 
     # Private methods
     cdef void _init_reader(self) except *
+    cdef void _load_samples(self) except *
     cdef void _load_samples_from_bgen(self) except *
     cdef void _ensure_open(self) except *
     cdef np.ndarray _validate_sample_indices(self, object sample_indices)

@@ -1,7 +1,15 @@
 [build-system]
 # Build against NumPy 2.x: the resulting extensions are ABI-compatible with
 # runtime NumPy >= 1.23 and forward-compatible with 2.x (one wheel covers both).
-requires = ["setuptools>=77", "wheel", "Cython>=0.29.0", "numpy>=2.0.0", "cmake>=3.12"]
+requires = [
+    "setuptools>=77",
+    "wheel",
+    "Cython>=0.29.0",
+    "numpy>=2.0.0",
+    # Only the Windows zstd build shells out to CMake; libdeflate and the Unix
+    # zstd build compile directly from source.
+    'cmake>=3.12; sys_platform == "win32"',
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -60,14 +68,14 @@ dev = [
 
 [tool.setuptools]
 # Keep the wheel lean: ship only .py + compiled .so. The C/Cython sources and
-# vendored zlib-ng/zstd trees are build-time-only (statically linked into the
+# vendored libdeflate/zstd trees are build-time-only (statically linked into the
 # extensions) and stay in the sdist, not the installed wheel.
 include-package-data = false
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["lazybgen*"]
-exclude = ["lazybgen.zlib-ng*", "lazybgen.zstd*"]
+exclude = ["lazybgen.libdeflate*", "lazybgen.zstd*"]
 
 [tool.setuptools.package-data]
 # PEP 561 marker so type-checkers pick up lazybgen's hints (must be listed
@@ -77,13 +85,13 @@ lazybgen = ["py.typed"]
 [tool.black]
 line-length = 120
 # Vendored libs and the Cython-generated _build_config are not ours to format.
-extend-exclude = '/(zlib-ng|zstd)/|_build_config\.py'
+extend-exclude = '/(libdeflate|zstd)/|_build_config\.py'
 
 [tool.ruff]
 line-length = 120
 target-version = "py39"
 # Vendored libs and the Cython-generated _build_config are not ours to lint.
-extend-exclude = ["lazybgen/zlib-ng", "lazybgen/zstd", "lazybgen/_build_config.py"]
+extend-exclude = ["lazybgen/libdeflate", "lazybgen/zstd", "lazybgen/_build_config.py"]
 
 [tool.ruff.lint]
 # pycodestyle errors, pyflakes, warnings, import sorting. Formatting stays with black.
@@ -98,8 +106,8 @@ markers = [
 ]
 
 [tool.cibuildwheel]
-# Use PEP 517 `build` so the [build-system].requires toolchain (cmake, Cython,
-# numpy) is provisioned under isolation. Vendored zlib-ng/zstd come from the
+# Use PEP 517 `build` so the [build-system].requires toolchain (Cython, numpy)
+# is provisioned under isolation. Vendored libdeflate/zstd come from the
 # recursive submodule checkout in the workflow.
 build-frontend = "build"
 # cibuildwheel builds CPython only by default (PyPy is opt-in via `enable`), so
@@ -110,14 +118,14 @@ build-frontend = "build"
 # can still build from the sdist.
 skip = ["cp314t-*", "*-musllinux_i686", "*_i686", "*-win32"]
 # Smoke test each built wheel: importing the compiled extensions proves the
-# wheel links its bundled zlib-ng/zstd/sqlite correctly in a clean environment.
+# wheel links its bundled libdeflate/zstd/sqlite correctly in a clean environment.
 test-command = "python -c \"import lazybgen; from lazybgen import load_bgen, BgenReader, load_variant_filter, reader; print('wheel import OK')\""
 
 [tool.cibuildwheel.linux]
-# manylinux/musllinux containers need sqlite headers; cmake comes from the
-# build-system requires (the `cmake` wheel) under build isolation.
+# manylinux/musllinux containers need sqlite headers; the vendored libraries
+# compile directly from source and need no extra build tooling.
 before-all = "yum install -y sqlite-devel || apk add --no-cache sqlite-dev || true"
 
 [tool.cibuildwheel.macos]
-# arm64 wheels require a 11.0+ deployment target (see setup.py zlib-ng cmake).
+# arm64 wheels require a 11.0+ deployment target.
 environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }

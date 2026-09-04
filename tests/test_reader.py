@@ -1142,3 +1142,49 @@ def test_get_build_info_is_public():
     info = lazybgen.get_build_info()
     assert isinstance(info, dict)
     assert info["type"] in {"vendored", "system"}
+
+
+# ---------------------------------------------------------------------------
+# Sample IDs: materialized on demand, but with the same contract as before
+# ---------------------------------------------------------------------------
+def test_samples_available_after_close(test_paths):
+    """Sample IDs stay readable once the reader is closed, from either source.
+
+    They are materialized on first access rather than at open, so this pins that
+    closing the file does not take the answer away.
+    """
+    reader = BgenReader(str(test_paths["bgen_file"]))
+    reader.close()
+    assert len(reader.samples) == reader.nsamples
+
+    reader = BgenReader(str(test_paths["bgen_file"]), sample_path=str(test_paths["sample_file"]))
+    reader.close()
+    assert len(reader.samples) == reader.nsamples
+
+
+def test_samples_are_cached(test_paths):
+    """Repeated access returns the same materialized list, not a fresh parse."""
+    with BgenReader(str(test_paths["bgen_file"])) as reader:
+        assert reader.samples is reader.samples
+
+
+def test_samples_from_sample_file_match_second_column(test_paths):
+    """The .sample path yields column 2 (ID_2) of each row after the two headers."""
+    lines = Path(test_paths["sample_file"]).read_text().splitlines()
+    expected = [p[1] for p in (line.split() for line in lines[2:]) if len(p) >= 2]
+    with BgenReader(str(test_paths["bgen_file"]), sample_path=str(test_paths["sample_file"])) as reader:
+        assert reader.samples == expected
+
+
+def test_sample_file_rows_with_too_few_fields_are_skipped(test_paths, tmp_path):
+    """A row without at least two fields contributes no sample ID."""
+    ragged = tmp_path / "ragged.sample"
+    ragged.write_text("ID_1 ID_2 missing\n0 0 0\nA A 0\nB\n\nC C 0\n")
+    with BgenReader(str(test_paths["bgen_file"]), sample_path=str(ragged)) as reader:
+        assert reader.samples == ["A", "C"]
+
+
+def test_nonexistent_sample_file_raises_at_open(test_paths, tmp_path):
+    """A missing .sample file is reported when the reader is opened, not later."""
+    with pytest.raises(FileNotFoundError):
+        BgenReader(str(test_paths["bgen_file"]), sample_path=str(tmp_path / "nope.sample"))

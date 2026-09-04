@@ -25,11 +25,15 @@ byte-range reads. It was extracted from
 - **Parallel decode by default**: blocks are inflated and decoded across
   auto-detected CPU cores, several times faster on multi-core machines and
   byte-identical to single-threaded decoding; opt out with `num_threads=1`.
+- **Zero-copy local reads**: a local BGEN is memory-mapped, so a block decode
+  reads each variant record in place instead of copying it, which removes the
+  serial bottleneck that previously capped multi-threaded scaling and keeps peak
+  memory to the output matrix.
 - Format coverage: BGEN layout v1.2 / v1.3 (best-effort v1.1), 8/16/32-bit, zlib
   and zstd compression, for biallelic diploid (phased or unphased) variants.
   Multi-allelic, non-diploid, and uncompressed inputs raise a clear error rather
   than returning wrong dosages.
-- Vendored, statically linked zlib-ng and zstd for consistent cross-platform
+- Vendored, statically linked libdeflate and zstd for consistent cross-platform
   decompression; ships a `py.typed` marker and prebuilt wheels
   (manylinux/musllinux x86_64, macOS arm64). `get_build_info()` reports the
   compression backend the package was built against.

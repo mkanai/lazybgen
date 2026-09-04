@@ -62,27 +62,53 @@ def _create_progress_callback(show_progress: bool, total: int, desc: str = "Load
     return callback
 
 
-def _validate_dosages(dosages) -> None:
-    """Validate dosage values are within expected range."""
+def _validate_dosages(dosages) -> bool:
+    """Validate dosage values are within expected range; report missing data.
+
+    Returns True if the matrix contains any NaN (missing genotypes).
+
+    NaN propagates through np.min / np.max, so this single min/max pair answers
+    both questions at once: a NaN result means missing data is present, and any
+    real value outside [0, 2] still shows up in the min or the max. That keeps
+    the common (no missing data) case to two scans of the matrix, instead of a
+    third isnan scan plus a full-size boolean temporary, which at biobank scale
+    is gigabytes of avoidable traffic.
+    """
     # Lazy import numpy
     import numpy as np
 
-    # Empty array: nothing to check (np.nanmin/np.nanmax would raise on it).
+    # Empty array: nothing to check (np.min/np.max would raise on it).
     if dosages.size == 0:
-        return
+        return False
 
-    # One scan each for min and max is sufficient (no separate all-NaN prepass):
-    # for an all-NaN array nanmin and nanmax return NaN (with an "All-NaN slice"
-    # RuntimeWarning we suppress), and both NaN < 0.0 and NaN > 2.0 are False, so
-    # the range check is correctly skipped. +/-inf is not NaN, so it still flows
-    # through and is caught below.
-    import warnings
+    min_dosage = dosages.min()
+    max_dosage = dosages.max()
+    has_nan = bool(min_dosage != min_dosage or max_dosage != max_dosage)
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        min_dosage = np.nanmin(dosages)
-        max_dosage = np.nanmax(dosages)
+    if has_nan:
+        # Re-scan ignoring NaN so the range check still sees the real values.
+        # For an all-NaN array nanmin and nanmax return NaN (with an "All-NaN
+        # slice" RuntimeWarning we suppress), and both NaN < 0.0 and NaN > 2.0
+        # are False, so the range check is correctly skipped. +/-inf is not NaN,
+        # so it never reaches here and is caught by the plain min/max above.
+        import warnings
 
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            min_dosage = np.nanmin(dosages)
+            max_dosage = np.nanmax(dosages)
+
+    _check_dosage_range(min_dosage, max_dosage)
+
+    return has_nan
+
+
+def _check_dosage_range(min_dosage, max_dosage) -> None:
+    """Raise if the observed dosage bounds fall outside [0, 2].
+
+    Both bounds ignore missing calls, so an all-missing result arrives as
+    inf / -inf and correctly passes: there is no real value to be out of range.
+    """
     if min_dosage < 0.0 or max_dosage > 2.0:
         raise ValueError(
             f"Dosage values out of valid range [0, 2] detected "
@@ -264,10 +290,20 @@ def load_bgen(
         # Validate genotypes. The output dtype is validated as floating-point at
         # the reader boundary (BgenReader.load_variants), so by here the dosages
         # are guaranteed real-valued; only the value range needs checking.
-        _validate_dosages(dosages)
+        # The block decode summarizes the values as it writes them, so prefer
+        # its answer; scanning the matrix here would re-read every byte of it
+        # from memory, which at biobank scale costs more than the decode did.
+        # The per-variant serial path reports nothing, and then we scan.
+        stats = reader.last_dosage_stats
+        if stats is None:
+            has_nan = _validate_dosages(dosages)
+        else:
+            min_dosage, max_dosage, has_nan = stats
+            _check_dosage_range(min_dosage, max_dosage)
 
-        # Handle NaN values if present
-        if np.any(np.isnan(dosages)):
+        # Handle NaN values if present, reusing the answer from above rather
+        # than scanning again.
+        if has_nan:
             dosages, variant_info, filtered_sample_ids = handle_nan_values(
                 dosages, variant_info, filtered_sample_ids, nan_action
             )

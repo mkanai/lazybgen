@@ -17,8 +17,8 @@ recursive-include lazybgen *.cpp *.h *.hpp
 exclude lazybgen/reader.cpp
 exclude lazybgen/_build_config.py
 
-# Vendored compression libraries (zlib-ng, zstd submodules)
-recursive-include lazybgen/zlib-ng *
+# Vendored compression libraries (libdeflate, zstd submodules)
+recursive-include lazybgen/libdeflate *
 recursive-include lazybgen/zstd *
 
 # Tests + fixtures: shipped in the sdist (so downstream packagers can verify a

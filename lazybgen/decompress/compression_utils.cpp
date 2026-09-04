@@ -4,14 +4,60 @@
 #include <sstream>
 
 // Include vendored compression libraries
-extern "C" {
-#include "zlib.h"  // Will be provided by CMake include paths
-}
-#include "zstd.h"  // Will be provided by CMake include paths
+#include "libdeflate.h"  // Will be provided by the build's include paths
+#include "zstd.h"        // Will be provided by the build's include paths
 
 namespace lazybgen {
 namespace bgen {
 namespace decompress {
+
+namespace {
+
+/**
+ * Per-thread libdeflate decompressor.
+ *
+ * A libdeflate_decompressor holds mutable decode state, so it must not be
+ * shared between threads. Allocating one is cheap, but the block decode path
+ * calls decompress_zlib once per variant across many worker threads, so each
+ * thread keeps its own for its lifetime and the allocation never lands on the
+ * per-variant hot path.
+ */
+struct DecompressorHandle {
+    libdeflate_decompressor* d;
+
+    DecompressorHandle() : d(libdeflate_alloc_decompressor()) {}
+
+    ~DecompressorHandle() {
+        if (d) {
+            libdeflate_free_decompressor(d);
+        }
+    }
+
+    DecompressorHandle(const DecompressorHandle&) = delete;
+    DecompressorHandle& operator=(const DecompressorHandle&) = delete;
+};
+
+libdeflate_decompressor* thread_decompressor() {
+    static thread_local DecompressorHandle handle;
+    return handle.d;
+}
+
+const char* result_name(enum libdeflate_result result) {
+    switch (result) {
+        case LIBDEFLATE_SUCCESS:
+            return "success";
+        case LIBDEFLATE_BAD_DATA:
+            return "invalid or corrupt compressed data";
+        case LIBDEFLATE_SHORT_OUTPUT:
+            return "stream decompressed to fewer bytes than expected";
+        case LIBDEFLATE_INSUFFICIENT_SPACE:
+            return "output buffer too small";
+        default:
+            return "unknown error";
+    }
+}
+
+}  // namespace
 
 CompressionResult decompress_zlib(const uint8_t* compressed, size_t compressed_size,
                                   uint8_t* output, size_t output_size) {
@@ -19,60 +65,42 @@ CompressionResult decompress_zlib(const uint8_t* compressed, size_t compressed_s
         return CompressionResult(false, "Invalid input parameters");
     }
 
-    // Validate input parameters
+    libdeflate_decompressor* decompressor = thread_decompressor();
+    if (!decompressor) {
+        return CompressionResult(false, "Failed to allocate DEFLATE decompressor");
+    }
 
-    // Initialize zlib stream
-    z_stream stream;
-    std::memset(&stream, 0, sizeof(stream));
-
-    stream.next_in = const_cast<Bytef*>(compressed);
-    stream.avail_in = static_cast<uInt>(compressed_size);
-    stream.next_out = output;
-    stream.avail_out = static_cast<uInt>(output_size);
-
-    // Initialize inflation based on format
-    // Check for zlib header to determine format
+    // Select the stream format from the leading bytes.
     // BGEN v1.1 uses standard zlib (with header)
     // BGEN v1.2 uses raw deflate (no header)
-    int ret;
-    if (compressed_size >= 2 && compressed[0] == 0x78 &&
+    const bool zlib_wrapped =
+        compressed_size >= 2 && compressed[0] == 0x78 &&
         (compressed[1] == 0x01 || compressed[1] == 0x5E || compressed[1] == 0x9C ||
-         compressed[1] == 0xDA)) {
-        // Standard zlib format detected (v1.1)
-        ret = inflateInit(&stream);
-    } else {
-        // Raw deflate format (v1.2)
-        ret = inflateInit2(&stream, -15);
-    }
+         compressed[1] == 0xDA);
 
-    if (ret != Z_OK) {
-        std::stringstream ss;
-        ss << "Failed to initialize zlib decompression: " << ret;
-        if (stream.msg)
-            ss << " (" << stream.msg << ")";
-        return CompressionResult(false, ss.str());
-    }
+    // The caller supplies the exact size the block declares, so pass a non-NULL
+    // actual_out_nbytes_ret: a stream that yields fewer bytes returns the short
+    // count here rather than an error, leaving the size check to the caller
+    // (which knows whether a short block is fatal).
+    size_t bytes_written = 0;
+    enum libdeflate_result result =
+        zlib_wrapped ? libdeflate_zlib_decompress(decompressor, compressed, compressed_size, output,
+                                                  output_size, &bytes_written)
+                     : libdeflate_deflate_decompress(decompressor, compressed, compressed_size,
+                                                     output, output_size, &bytes_written);
 
-    // Perform decompression
-    ret = inflate(&stream, Z_FINISH);
-    size_t bytes_written = output_size - stream.avail_out;
-
-    // Clean up
-    inflateEnd(&stream);
-
-    if (ret == Z_STREAM_END) {
+    if (result == LIBDEFLATE_SUCCESS) {
         return CompressionResult(true, "", bytes_written);
-    } else if (ret == Z_OK) {
-        // Partial decompression (output buffer too small)
-        return CompressionResult(false, "Output buffer too small", bytes_written);
-    } else {
-        // Error
-        std::stringstream ss;
-        ss << "Zlib decompression failed: " << ret;
-        if (stream.msg)
-            ss << " (" << stream.msg << ")";
-        return CompressionResult(false, ss.str(), bytes_written);
     }
+
+    if (result == LIBDEFLATE_INSUFFICIENT_SPACE) {
+        return CompressionResult(false, "Output buffer too small", 0);
+    }
+
+    std::stringstream ss;
+    ss << "Zlib decompression failed: " << static_cast<int>(result) << " ("
+       << result_name(result) << ")";
+    return CompressionResult(false, ss.str(), 0);
 }
 
 CompressionResult decompress_zstd(const uint8_t* compressed, size_t compressed_size,
@@ -99,7 +127,7 @@ CompressionResult decompress_zstd(const uint8_t* compressed, size_t compressed_s
 }
 
 bool initialize_compression_libraries() {
-    // Both zlib-ng and zstd are statically linked and don't require
+    // Both libdeflate and zstd are statically linked and don't require
     // explicit initialization in our case
     return true;
 }

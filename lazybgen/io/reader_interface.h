@@ -39,6 +39,25 @@ class FileReader {
     virtual size_t read_at(uint64_t offset, uint8_t* buffer, size_t size) = 0;
 
     /**
+     * Borrow a read-only view of [offset, offset + size) without copying
+     *
+     * A memory-mapped reader can hand back a pointer into its mapping; a
+     * streaming or remote reader cannot and returns nullptr, in which case the
+     * caller must read_at() into a buffer it owns. The returned pointer stays
+     * valid until the reader is closed, and the bytes are safe to read from any
+     * thread.
+     *
+     * @param offset File offset the view starts at
+     * @param size Number of bytes the view must cover
+     * @return Pointer to the bytes, or nullptr if this reader cannot provide one
+     */
+    virtual const uint8_t* view_at(uint64_t offset, size_t size) const {
+        (void)offset;
+        (void)size;
+        return nullptr;
+    }
+
+    /**
      * Seek to specific position
      *
      * @param offset File offset to seek to

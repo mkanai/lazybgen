@@ -1,6 +1,6 @@
-[submodule "lazybgen/zlib-ng"]
-	path = lazybgen/zlib-ng
-	url = https://github.com/zlib-ng/zlib-ng.git
 [submodule "lazybgen/zstd"]
 	path = lazybgen/zstd
 	url = https://github.com/facebook/zstd.git
+[submodule "lazybgen/libdeflate"]
+	path = lazybgen/libdeflate
+	url = https://github.com/ebiggers/libdeflate.git

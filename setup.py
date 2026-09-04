@@ -38,64 +38,66 @@ BGEN_DIR = Path("lazybgen")
 BUILD_DIR = Path("build")
 
 
-def build_zlib_ng():
-    """Build zlib-ng from submodule."""
-    zlib_dir = BGEN_DIR / "zlib-ng"
-    zlib_build_dir = BUILD_DIR / "zlib-ng"
+def build_libdeflate():
+    """Build libdeflate from submodule."""
+    ld_dir = BGEN_DIR / "libdeflate"
+    ld_build_dir = BUILD_DIR / "libdeflate"
 
-    if not zlib_dir.exists() or not any(zlib_dir.iterdir()):
+    if not ld_dir.exists() or not any(ld_dir.iterdir()):
         raise RuntimeError(
-            f"zlib-ng submodule not found at {zlib_dir}\n\n"
+            f"libdeflate submodule not found at {ld_dir}\n\n"
             "The vendored compression libraries are missing. Please run:\n"
             "  git submodule update --init --recursive\n\n"
             "Or clone with submodules:\n"
             "  git clone --recursive https://github.com/mkanai/lazybgen.git\n"
         )
 
-    zlib_build_dir.mkdir(parents=True, exist_ok=True)
-
-    cmake_args = [
-        "cmake",
-        "-S",
-        str(zlib_dir.absolute()),
-        "-B",
-        str(zlib_build_dir.absolute()),
-        "-DCMAKE_BUILD_TYPE=Release",
-        "-DZLIB_COMPAT=ON",  # Enable zlib compatibility mode
-        "-DBUILD_SHARED_LIBS=OFF",  # Build static library
-        "-DZLIB_ENABLE_TESTS=OFF",  # Disable tests to avoid GTest dependency
-        "-DWITH_GTEST=OFF",  # Disable GTest
-        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",  # Enable -fPIC for static libs
-    ]
-
-    if sys.platform == "darwin":
-        # Honor MACOSX_DEPLOYMENT_TARGET (set by cibuildwheel); arm64 requires >= 11.0
-        deployment_target = os.environ.get("MACOSX_DEPLOYMENT_TARGET", "10.9")
-        cmake_args.extend([f"-DCMAKE_OSX_DEPLOYMENT_TARGET={deployment_target}"])
-
-    try:
-        subprocess.check_call(cmake_args)
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(
-            f"CMake configuration failed with error: {e}\n\n"
-            "Please ensure CMake is installed:\n"
-            "  Ubuntu/Debian: sudo apt-get install cmake\n"
-            "  macOS: brew install cmake\n"
-            "  pip: pip install cmake\n"
-        )
-
-    subprocess.check_call(["cmake", "--build", str(zlib_build_dir), "--config", "Release"])
+    ld_build_dir.mkdir(parents=True, exist_ok=True)
 
     if sys.platform == "win32":
-        lib_path = zlib_build_dir / "Release" / "zlibstatic.lib"
+        cmake_args = [
+            "cmake",
+            "-S",
+            str(ld_dir.absolute()),
+            "-B",
+            str(ld_build_dir.absolute()),
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DLIBDEFLATE_BUILD_SHARED_LIB=OFF",
+            "-DLIBDEFLATE_BUILD_GZIP=OFF",
+            "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+        ]
+        try:
+            subprocess.check_call(cmake_args)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"CMake configuration failed with error: {e}\n\n"
+                "Please ensure CMake is installed:\n"
+                "  pip: pip install cmake\n"
+            )
+        subprocess.check_call(["cmake", "--build", str(ld_build_dir), "--config", "Release"])
+        lib_path = ld_build_dir / "Release" / "deflatestatic.lib"
     else:
-        lib_path = zlib_build_dir / "libz.a"
+        # On Unix-like systems, compile directly. libdeflate is plain C with no
+        # configuration step, so this avoids a CMake dependency entirely.
+        sources = sorted(str(p) for p in ld_dir.glob("lib/*.c"))
+        sources += sorted(str(p) for p in ld_dir.glob("lib/*/*.c"))
+
+        compiler = new_compiler()
+        if sys.platform == "darwin":
+            compiler.compiler_so[0] = "clang"
+            compiler.compiler[0] = "clang"
+
+        compile_args = ["-O2", "-fPIC", "-I" + str(ld_dir)]
+        objects = compiler.compile(sources, output_dir=str(ld_build_dir), extra_preargs=compile_args)
+
+        lib_path = ld_build_dir / "libdeflate.a"
+        subprocess.check_call(["ar", "rcs", str(lib_path)] + objects)
 
     if not lib_path.exists():
-        raise RuntimeError(f"Failed to find built zlib-ng library at {lib_path}")
+        raise RuntimeError(f"Failed to find built libdeflate library at {lib_path}")
 
-    # Return the build directory for headers since that's where zlib.h is generated
-    return str(lib_path), str(zlib_build_dir)
+    # libdeflate.h sits at the root of the source tree
+    return str(lib_path), str(ld_dir)
 
 
 def build_zstd():
@@ -233,14 +235,14 @@ def get_build_info():
     if COMPRESSION_BACKEND == "vendored":
         return {{
             "type": "vendored",
-            "zlib": "zlib-ng (zlib-compatible, optimized)",
+            "deflate": "libdeflate 1.26",
             "zstd": "zstd 1.5.7",
             "note": "Using vendored high-performance compression libraries",
         }}
     else:
         return {{
             "type": "system",
-            "zlib": "System zlib",
+            "deflate": "System libdeflate",
             "zstd": "System zstd",
             "note": "Using system compression libraries",
         }}
@@ -261,20 +263,22 @@ def get_build_info():
             print("Using system libraries as requested via LAZYBGEN_USE_SYSTEM_LIBS")
             for ext in self.extensions:
                 if "bgen" in ext.name:
-                    ext.libraries.extend(["z", "zstd"])
+                    ext.libraries.extend(["deflate", "zstd"])
 
             self._write_build_config("system")
         else:
             try:
                 print("Building vendored compression libraries...")
-                zlib_lib, zlib_include = build_zlib_ng()
+                ld_lib, ld_include = build_libdeflate()
                 zstd_lib, zstd_include = build_zstd()
 
                 for ext in self.extensions:
                     if "bgen" in ext.name:
-                        ext.include_dirs = [d for d in ext.include_dirs if "zlib-ng" not in d and "zstd/lib" not in d]
-                        ext.include_dirs.extend([zlib_include, zstd_include])
-                        ext.extra_objects.extend([zlib_lib, zstd_lib])
+                        ext.include_dirs = [
+                            d for d in ext.include_dirs if "libdeflate" not in d and "zstd/lib" not in d
+                        ]
+                        ext.include_dirs.extend([ld_include, zstd_include])
+                        ext.extra_objects.extend([ld_lib, zstd_lib])
 
                 print("Successfully built vendored compression libraries")
                 self._write_build_config("vendored")
@@ -283,12 +287,12 @@ def get_build_info():
                 error_msg = f"""
 Failed to build vendored compression libraries: {e}
 
-lazybgen requires building zlib-ng and zstd from source for optimal
+lazybgen requires building libdeflate and zstd from source for optimal
 performance and consistency. The build failed with the above error.
 
 Possible solutions:
-1. Ensure you have CMake installed: pip install cmake
-2. Ensure you have a C++ compiler installed
+1. Ensure you have a C and C++ compiler installed
+2. On Windows, ensure you have CMake installed: pip install cmake
 3. Check the error message above for specific issues
 
 If you want to use system libraries instead (not recommended), you can:
@@ -332,7 +336,7 @@ extensions = [
             "lazybgen/index",  # BGI reader headers
             "lazybgen/format",  # Format headers
             "lazybgen/decompress",  # Decompressor headers
-            "lazybgen/zlib-ng",  # zlib-ng headers
+            "lazybgen/libdeflate",  # libdeflate headers
             "lazybgen/zstd/lib",  # zstd headers
         ],
         libraries=["sqlite3"],

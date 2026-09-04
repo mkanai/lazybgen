@@ -1,6 +1,6 @@
 # See https://pre-commit.com. Install with: pre-commit install
 # Run on all files: pre-commit run --all-files
-exclude: '^lazybgen/(zlib-ng|zstd)/|^lazybgen/_build_config\.py$'
+exclude: '^lazybgen/(libdeflate|zstd)/|^lazybgen/_build_config\.py$'
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks

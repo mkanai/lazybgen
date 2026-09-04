@@ -11,7 +11,7 @@ or regions you ask for, fetching them directly from local files, GCS, or S3 via
 random-access byte-range reads, so there is no need to download the whole file.
 
 It is a Cython/C++ implementation with vendored, optimized compression backends
-(zlib-ng and zstd) compiled from source for consistent cross-platform behavior
+(libdeflate and zstd) compiled from source for consistent cross-platform behavior
 and speed (SIMD genotype parsing, parallel block decompression).
 
 ## Install
@@ -34,8 +34,8 @@ cd lazybgen
 pip install .
 ```
 
-Building from source requires a C++ compiler and CMake (`pip install cmake`).
-The vendored `zlib-ng` and `zstd` are git submodules, so clone with `--recursive`
+Building from source requires a C/C++ compiler (CMake is needed on Windows only).
+The vendored `libdeflate` and `zstd` are git submodules, so clone with `--recursive`
 (or run `git submodule update --init --recursive`).
 
 ## Usage
@@ -114,7 +114,7 @@ v1.2 / v1.3 (re-encode with `qctool2` if needed) for production use.
 ### Build info
 
 `from lazybgen import get_build_info` returns the compression backend the package
-was built against (vendored zlib-ng / zstd, or system libraries).
+was built against (vendored libdeflate / zstd, or system libraries).
 
 ### Remote `.bgi` index caching
 

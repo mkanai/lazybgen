@@ -37,6 +37,23 @@ struct BgenHeader {
  * This class handles reading BGEN files, managing decompression,
  * and providing efficient access to genetic variants.
  */
+/**
+ * Summary of the dosage values a block decode wrote.
+ *
+ * min_value / max_value ignore NaN, so an all-NaN (or empty) block leaves them
+ * at +inf / -inf and any range test on them is correctly a no-op. has_nan
+ * reports whether any missing call was written.
+ *
+ * The decode touches every value while it is still hot in cache, so gathering
+ * this there costs almost nothing, whereas scanning the finished matrix for the
+ * same answers is gigabytes of DRAM traffic per read at biobank scale.
+ */
+struct DosageStats {
+    double min_value;
+    double max_value;
+    bool has_nan;
+};
+
 class BgenReaderImpl {
    public:
     /**
@@ -64,9 +81,24 @@ class BgenReaderImpl {
     /**
      * Get sample IDs from BGEN file
      *
-     * @return Vector of sample IDs
+     * Returned by reference: at biobank scale this vector holds hundreds of
+     * thousands of strings, so callers must not pay for a copy they do not
+     * want. A file with no sample block has its placeholder IDs built on the
+     * first call rather than at open.
+     *
+     * @return Reference to the vector of sample IDs
      */
-    std::vector<std::string> sample_ids();
+    const std::vector<std::string>& sample_ids();
+
+    /**
+     * Stats for the values written by the most recent block decode
+     *
+     * Only the read_decode_block_* entry points set this; it is meaningless
+     * before the first such call.
+     *
+     * @return Reference to the last block's dosage stats
+     */
+    const DosageStats& last_block_stats() const;
 
     /**
      * Build decode-ready variant metadata from BGI index entries, without
