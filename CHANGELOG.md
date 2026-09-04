@@ -7,8 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.0] - Unreleased
 
-A performance release, plus a faster default transport for `gs://` reads. The API
-is unchanged and every read returns byte-identical dosages to 0.1.0.
+A performance release, plus a faster default transport for `gs://` reads. Every
+read returns byte-identical dosages to 0.1.0, and the reading API is unchanged;
+the one signature change is to `get_build_info()`, which now reports the DEFLATE
+backend under a `deflate` key where 0.1.0 used `zlib`.
 
 ### Removed
 
@@ -41,6 +43,9 @@ is unchanged and every read returns byte-identical dosages to 0.1.0.
   unavailable or cannot express an entry in `storage_options`, so an option that
   decides which bytes come back is never silently dropped. `storage_options` keep
   their fsspec spelling on either transport, and requester-pays works on both.
+- `BgenReader.remote_backend` reports the transport a reader resolved to, and
+  `BgenReader.last_dosage_stats` the `(min, max, has_nan)` summary a block decode
+  produced, or `None` when no path computed one.
 - **Zero-copy local reads**: a local BGEN is memory-mapped, so a block decode
   reads each variant record in place instead of copying it. This removes the
   serial bottleneck that previously capped multi-threaded scaling.
@@ -49,7 +54,7 @@ is unchanged and every read returns byte-identical dosages to 0.1.0.
 
 - **libdeflate replaces zlib-ng** for DEFLATE decode (1.4-1.7x on inflate).
   `get_build_info()` now reports the backend under the keys `type`, `deflate`,
-  `zstd` and `note`. Nothing shells out to CMake on Unix any more; it is needed
+  `zstd` and `note`; code reading the old `zlib` key must be updated. Nothing shells out to CMake on Unix any more; it is needed
   only for the Windows zstd build.
 - **Decode workers claim runs of variants** rather than one at a time, which
   fixes page-fault serialization on a freshly allocated output matrix.

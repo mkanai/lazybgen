@@ -75,9 +75,24 @@ def test_gcs_requester_pays_true_falls_back_to_the_environment(monkeypatch):
     assert got["client_options"]["default_headers"]["x-goog-user-project"] == "env-project"
 
 
-def test_gcs_project_alone_adds_no_header():
-    # Without requester_pays the project does not change which bytes are read.
-    assert translate_storage_options("gs", {"project": "some-project"}) == {}
+def test_gcs_project_alone_is_refused():
+    # gcsfs treats a bare `project` as an assertion: its google_default path
+    # raises when the value does not match the credential's own project. obstore
+    # cannot check that, so honoring the option would turn a caller's error into
+    # a silent success.
+    with pytest.raises(UnsupportedStorageOption, match="project"):
+        translate_storage_options("gs", {"project": "some-project"})
+    assert resolve_remote_backend("gs://b/k.bgen", {"project": "some-project"}, "auto") == "fsspec"
+
+
+def test_gcs_project_with_requester_pays_names_the_billing_project():
+    got = translate_storage_options("gs", {"requester_pays": True, "project": "billed"})
+    assert got["client_options"]["default_headers"]["x-goog-user-project"] == "billed"
+
+
+def test_a_named_project_blocks_the_anonymous_retry():
+    fs = obstore_backend.ObstoreFileSystem(project="some-project")
+    assert fs._may_retry_anonymously("gs") is False
 
 
 def test_gcs_token_default_values_are_the_default_chain():
@@ -239,6 +254,80 @@ def test_cat_ranges_requires_matching_lengths():
 @requires_obstore
 def test_cat_ranges_of_nothing_is_nothing():
     assert obstore_backend.ObstoreFileSystem().cat_ranges([], [], []) == []
+
+
+# --- default-credential compatibility ---
+
+
+def _write_adc(tmp_path, kind, name="adc.json"):
+    import json
+
+    path = tmp_path / name
+    path.write_text(json.dumps({"type": kind, "client_id": "a"}))
+    return path
+
+
+@pytest.mark.parametrize("kind", ["external_account", "impersonated_service_account"])
+def test_credentials_obstore_cannot_load_send_the_read_to_fsspec(tmp_path, monkeypatch, kind):
+    """google.auth loads these; object_store's GCS store cannot.
+
+    Workload Identity Federation (external_account) is how GitHub Actions and
+    cross-cloud deployments authenticate, so this is not an exotic case. Letting
+    "auto" pick obstore there would turn working code into an open-time error.
+    """
+    adc = _write_adc(tmp_path, kind)
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(adc))
+    monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+
+    with pytest.raises(UnsupportedStorageOption, match=kind):
+        translate_storage_options("gs", None)
+    assert resolve_remote_backend("gs://b/k.bgen", None, "auto") == "fsspec"
+
+
+@pytest.mark.parametrize("kind", ["service_account", "authorized_user"])
+def test_credentials_obstore_can_load_stay_on_obstore(tmp_path, monkeypatch, kind):
+    adc = _write_adc(tmp_path, kind)
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(adc))
+    monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+
+    assert translate_storage_options("gs", None) == {}
+
+
+def test_credentials_only_reachable_via_cloudsdk_config_send_the_read_to_fsspec(tmp_path, monkeypatch):
+    """The dangerous case: obstore does not consult CLOUDSDK_CONFIG.
+
+    It does not fail either. It falls through to the metadata server, so on a GCE
+    VM the two transports would read as different principals for identical
+    options, with nothing to indicate it.
+    """
+    (tmp_path / "application_default_credentials.json").write_text('{"type": "authorized_user"}')
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.setenv("CLOUDSDK_CONFIG", str(tmp_path))
+
+    with pytest.raises(UnsupportedStorageOption, match="CLOUDSDK_CONFIG"):
+        translate_storage_options("gs", None)
+    assert resolve_remote_backend("gs://b/k.bgen", None, "auto") == "fsspec"
+
+
+def test_an_explicit_credential_skips_the_default_chain_check(tmp_path, monkeypatch):
+    """The check is about the DEFAULT chain; a named credential is not it."""
+    bad = _write_adc(tmp_path, "external_account")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(bad))
+    key = tmp_path / "sa.json"
+    key.write_text('{"type": "service_account", "private_key": "x"}')
+
+    got = translate_storage_options("gs", {"token": str(key)})
+    assert got == {"service_account": str(key)}
+
+
+def test_no_credentials_anywhere_is_fine(tmp_path, monkeypatch):
+    """Both transports fall through to the metadata server, so they agree."""
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("os.path.expanduser", lambda p: str(tmp_path) if p == "~" else p)
+
+    assert translate_storage_options("gs", None) == {}
 
 
 # --- anonymous fallback -------------------------------------------------------

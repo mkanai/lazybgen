@@ -53,19 +53,24 @@ dependencies = [
     # single event loop. gcsfs/fsspec stay required, because they serve any
     # storage_options obstore cannot express and remain the fallback if obstore
     # is deselected at install time.
-    "obstore>=0.9.1",
+    # Upper bound because obstore is pre-1.0 and this reader depends on a specific
+    # keyword surface (get_ranges(coalesce=), client_options, request_payer). That
+    # surface has already moved once: coalesce only appeared in 0.9.1, and a
+    # release that moves it again would break every gs:// read with no fallback,
+    # since the transport is chosen before the first request is made.
+    "obstore>=0.9.1,<1",
 ]
 
 [project.optional-dependencies]
 s3 = ["s3fs>=2021.0.0"]
 # obstore is a default dependency. The extra is an alias, so `lazybgen[obstore]`
 # installs the same thing rather than failing.
-obstore = ["obstore>=0.9.1"]
+obstore = ["obstore>=0.9.1,<1"]
 dev = [
     "pytest>=6.0.0",
     "black>=25.11.0",
     "Cython>=0.29.0",
-    "cmake>=3.12",
+    'cmake>=3.12; sys_platform == "win32"',  # only the Windows zstd build needs it
     "ruff>=0.6.0",
     "check-wheel-contents>=0.6.0",  # guards against wheel bloat / missing py.typed
     # "bgen>=1.8.0",  # optional: enables correctness comparison vs a reference reader

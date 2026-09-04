@@ -214,18 +214,92 @@ def _require_service_account(payload: Any) -> None:
 # no anonymous step: it fails the token request instead. These are the fragments
 # of that failure, used to retry once unsigned and restore the 0.1.0 behavior for
 # the only case where the two transports differ on credentials.
-_MISSING_CREDENTIAL_HINTS = ("token request", "computemetadata", "credential")
+# Deliberately narrow. A broader match (a bare "credential", say) also catches a
+# REJECTED credential - an expired or malformed ADC file - and retrying that
+# unsigned would quietly read a public object as anonymous instead of reporting
+# that the caller's credentials are broken.
+_MISSING_CREDENTIAL_HINTS = ("computemetadata", "no credentials", "not find default credentials")
 
 # Options that leave the credential choice entirely to the transport. Anything
 # else means the caller named a credential, and a silent anonymous retry would
 # not be what they asked for.
-_CREDENTIAL_FREE_OPTIONS = frozenset({"token", "project"})
+_CREDENTIAL_FREE_OPTIONS = frozenset({"token"})
 _EXPLICIT_CREDENTIAL_KWARGS = ("service_account", "service_account_key", "skip_signature", "bearer_token")
 
 
 def _looks_like_missing_credentials(exc: BaseException) -> bool:
     text = str(exc).lower()
     return any(hint in text for hint in _MISSING_CREDENTIAL_HINTS)
+
+
+# Credential documents object_store's GCS store can load. google.auth accepts
+# more: "external_account" (Workload Identity Federation, e.g. GitHub Actions
+# OIDC) and "impersonated_service_account" both work on gcsfs and are a hard
+# error on obstore.
+_OBSTORE_ADC_TYPES = frozenset({"service_account", "authorized_user"})
+
+
+def _default_credentials_path() -> Optional[Tuple[str, bool]]:
+    """Where google.auth would find an ADC file, and whether obstore looks there.
+
+    Returns (path, obstore_looks_here) for the first candidate that exists, or
+    None when there is no ADC file at all (in which case both transports fall
+    through to the metadata server and agree).
+    """
+    explicit = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if explicit:
+        # object_store reads this variable too, so both transports load the same
+        # file and only its type can differ between them.
+        return (explicit, True) if os.path.exists(explicit) else None
+
+    # gcloud's config dir can be relocated. google.auth honors CLOUDSDK_CONFIG;
+    # object_store does not, and silently falls through to the metadata server,
+    # which on a GCE VM means reading as a DIFFERENT PRINCIPAL rather than
+    # failing. That is worse than an error, so it is refused below.
+    sdk_config = os.environ.get("CLOUDSDK_CONFIG")
+    if sdk_config:
+        path = os.path.join(sdk_config, "application_default_credentials.json")
+        if os.path.exists(path):
+            return path, False
+
+    if os.name == "nt":  # pragma: no cover - exercised only on Windows
+        appdata = os.environ.get("APPDATA")
+        home_path = os.path.join(appdata, "gcloud", "application_default_credentials.json") if appdata else None
+    else:
+        home_path = os.path.join(os.path.expanduser("~"), ".config", "gcloud", "application_default_credentials.json")
+    if home_path and os.path.exists(home_path):
+        return home_path, True
+    return None
+
+
+def _require_adc_obstore_can_use() -> None:
+    """Refuse the default credential chain when the two transports would differ.
+
+    Only called when the caller named no credential of their own, i.e. when both
+    transports would resolve one themselves. Raising sends the read to fsspec,
+    which keeps 0.1.0 behavior, instead of failing at open or reading as another
+    principal.
+    """
+    found = _default_credentials_path()
+    if found is None:
+        return
+    path, obstore_looks_here = found
+    if not obstore_looks_here:
+        raise UnsupportedStorageOption(
+            f"the credentials at {path!r} are found through CLOUDSDK_CONFIG, which the "
+            "obstore transport does not consult; it would read as a different principal"
+        )
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            kind = json.load(handle).get("type")
+    except (OSError, ValueError):
+        # Unreadable or not JSON: let the transport report it rather than
+        # guessing, since fsspec would fail on it too.
+        return
+    if kind not in _OBSTORE_ADC_TYPES:
+        raise UnsupportedStorageOption(
+            f"the credentials at {path!r} are of type {kind!r}, which the obstore " "transport cannot load"
+        )
 
 
 def _translate_gcs(options: Dict[str, Any]) -> Dict[str, Any]:
@@ -267,11 +341,30 @@ def _translate_gcs(options: Dict[str, Any]) -> Dict[str, Any]:
                 kwargs["service_account_key"] = json.dumps(value)
             else:
                 raise UnsupportedStorageOption(f"token={value!r} is not supported by the obstore transport")
-        elif key in ("requester_pays", "project"):
-            # Handled together below, since either can carry the billing project.
+        elif key == "requester_pays":
+            # Consumed below, together with any "project" that names the billing
+            # project for it.
+            continue
+        elif key == "project":
+            if not options.get("requester_pays"):
+                # Outside requester-pays, gcsfs uses `project` as an assertion:
+                # its google_default path raises when it does not match the ADC's
+                # own project. obstore has no equivalent, so honoring the option
+                # here would mean dropping a check the caller asked for and
+                # turning their error into a silent success.
+                raise UnsupportedStorageOption(
+                    "project is only supported by the obstore transport alongside "
+                    "requester_pays; on its own it asserts the credential's project, "
+                    "which obstore cannot check"
+                )
             continue
         else:
             raise UnsupportedStorageOption(f"{key!r} is not supported by the obstore transport")
+
+    if not any(name in kwargs for name in _EXPLICIT_CREDENTIAL_KWARGS):
+        # No credential was named, so obstore would resolve the default chain,
+        # and that chain is narrower than google.auth's.
+        _require_adc_obstore_can_use()
 
     if options.get("requester_pays"):
         # GCS requester-pays has no dedicated obstore setting. The XML API reads
@@ -416,11 +509,12 @@ class ObstoreFileSystem:
 
     def __init__(self, **storage_options: Any):
         self.storage_options = storage_options
-        # Translated once here rather than per _store() call. _store runs on every
-        # fan-out chunk, and for requester_pays=True translation can reach
-        # google.auth.default(), which off GCE shells out to gcloud: a subprocess
-        # per chunk, executed inside the very threads this transport exists to
-        # keep free. Raising here also surfaces a bad option at construction.
+        # Translated options, cached per scheme by _store(). The cache is the
+        # point: _store runs on every fan-out chunk, and for requester_pays=True
+        # translation can reach google.auth.default(), which off GCE shells out
+        # to gcloud once per call. The single-threaded size lookup or download
+        # that opens a file always populates this before any fan-out, so the
+        # gcloud call happens once and never inside a worker thread.
         self._store_kwargs: Dict[str, Dict[str, Any]] = {}
         # Object sizes seen by this instance. The reader asks for the size at
         # open and again when it opens the sequential handle, and a remote HEAD
@@ -495,7 +589,11 @@ class ObstoreFileSystem:
                 kwargs = dict(self._store_kwargs.get(scheme, {}))
                 kwargs["skip_signature"] = True
                 self._store_kwargs[scheme] = kwargs
-                logger.info("No GCP credentials found; reading %s anonymously.", url)
+                logger.warning(
+                    "No GCP credentials found; reading %s anonymously. Set credentials, "
+                    'or pass storage_options={"token": "anon"} to make this explicit.',
+                    url,
+                )
             return operation()
 
     # --- filesystem surface used by the reader --------------------------------

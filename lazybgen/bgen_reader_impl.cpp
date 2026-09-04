@@ -184,7 +184,7 @@ class MMapFileReader : public FileReader {
         // Let the kernel adapt its readahead to the actual access pattern
         // (MADV_NORMAL): it ramps up for sequential scans (full-file / large
         // contiguous region decodes) and stays modest for indexed lookups. The
-        // previous MADV_RANDOM disabled readahead entirely, which is fine for
+        // alternative, MADV_RANDOM, disables readahead entirely, which suits
         // scattered point reads but makes a cold full/region scan fault one page
         // at a time off disk (an order of magnitude slower than warm). Local
         // readahead over-fetch is nearly free (page cache, fast disk), unlike the
@@ -710,9 +710,9 @@ class BgenReaderImpl::Impl {
         // 16 MB as the tail of the work stops dividing evenly. Runs are capped
         // so every worker still gets several claims, which bounds how unevenly
         // the work can land. At biobank sample counts a single column already
-        // exceeds the target, so the run collapses to one variant and this is
-        // exactly the old path. column_bytes == 0 (a caller that does not know
-        // its output geometry) also keeps one-at-a-time claiming.
+        // exceeds the target, so the run collapses to one variant, i.e. to
+        // claiming one at a time. column_bytes == 0 (a caller that does not know
+        // its output geometry) claims one at a time too.
         size_t chunk = 1;
         if (column_bytes > 0) {
             const size_t run_target_bytes = static_cast<size_t>(4) << 20;

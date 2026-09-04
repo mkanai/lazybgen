@@ -7,8 +7,8 @@ that real missingness, both full and sample-filtered; pin sequential vs parallel
 decoder equivalence including the NaN mask; and guard the SIMD decode paths
 against returning a computed dosage for a genotype flagged missing.
 
-This is the real coverage of the error / mean / omit / warn paths on genuinely
-missing data (previous tests ran them only on clean fixtures).
+This is the coverage of the error / mean / omit / warn paths on genuinely
+missing data; a clean fixture cannot exercise any of them.
 """
 
 import warnings

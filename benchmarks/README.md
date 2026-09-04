@@ -47,9 +47,8 @@ compare fairly with each other but are not cold streaming rates.
 The slice workloads read `--region-variants` (default 2000) contiguous variants
 and `--scattered-variants` (default 1000) spread-out ones. These are the ladder's
 constant: a run that changes them is not comparable with one that does not, and
-the published tables below were measured at the older 500 / 200, which is what
-their column headers say. Re-running with the current defaults reproduces the
-ratios, not the wall times. Each result also carries `spread`, the range of the
+the column headers below say which sizes produced each table. Each result also
+carries `spread`, the range of the
 measured runs over their median, so a speedup smaller than the noise is visible
 rather than assumed.
 
@@ -81,7 +80,7 @@ used:
 |---------------|---------------------------------------|-----------------------------------------------|
 | `full_decode` | `load_bgen(path)`                     | iterate all variants, stack `alt_dosage`      |
 | `region`      | `load_bgen(region="chr:start-end")`   | `fetch(chrom, start, stop)` + `alt_dosage`    |
-| `scattered`   | `load_bgen(variant_filter=...)`       | `at_position(pos)` loop (200 variants)        |
+| `scattered`   | `load_bgen(variant_filter=...)`       | `at_position(pos)` loop (1000 variants)       |
 | `single`      | `load_bgen(region=)` (one variant)    | `at_position(pos)` (one variant)              |
 
 Both libraries populate a float64 dosage matrix of the same element count and
@@ -140,7 +139,7 @@ Two exceptions worth knowing:
 - **`single` depends on what the process has already read, so read that row
   carefully.** The ladder runs all four workloads for a size in one process, so
   by the time `single` runs the `.sample` file has been parsed and cached, and
-  one variant at 500k samples costs 21 ms. The same call in a *fresh* process
+  one variant at 500k samples costs 19.5 ms. The same call in a *fresh* process
   costs about 236 ms, because it parses 500k sample IDs first, which loses to the
   `bgen` package's 181 ms. Reading many variants amortizes that; reading exactly
   one does not.
@@ -176,9 +175,8 @@ are where the realistic large-file workloads live anyway.
 Peak RSS is read from the kernel's own high-water mark (`VmHWM`), reset per run.
 Sampling it from a Python thread does not work here: a decode holds the GIL for
 its whole duration, so the sampler never runs while the memory is actually in
-use, and the figure comes back near the pre-run baseline. Numbers published
-before 2026-09-03 were collected that way and understated peak memory, in some
-cases by more than 10x.
+use, and the figure comes back near the pre-run baseline, understating peak
+memory by more than 10x in some cases.
 
 ### Remote (`gs://`): lazy partial reads at biobank scale
 
@@ -188,10 +186,9 @@ fetches only the variants you ask for, so its partial-read time depends on the
 **sample count** and how many variants you request - **not** the total file size.
 
 **Remote comparisons must be interleaved.** A remote link drifts far more over
-minutes than the effects being measured (the same read has come back at 180 s,
-81 s and 24 s across one day on one machine), so two configurations measured as
-separate runs are not comparable. A non-interleaved comparison once reported a
-confident "3.2x slower" that an interleaved re-run turned into "2x faster".
+minutes than the effects being measured (one read has ranged over 180 s, 81 s
+and 24 s across a day on one machine), so two configurations measured as separate
+runs are not comparable: the drift is more than enough to invent or hide a 2x.
 `compare_remote_builds.py` alternates every configuration read by read; the table
 below comes from it, medians of 5 after a warmup.
 

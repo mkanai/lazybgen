@@ -215,8 +215,8 @@ Decoding runs in parallel across CPU cores by default: each block is inflated an
 decoded across worker threads, byte-identical to single-threaded decoding. This
 applies to `load_bgen`, `BgenReader.load_variants`, and `iter_variants`, for both
 all-samples and sample-filtered (cohort) reads, and scales with the sample and
-core count (e.g. ~5x faster on a 100K-sample load on a 16-core machine, ~3.7x on a
-cohort).
+core count: on a 16-core machine at 100k samples, a full decode is 6.8x faster
+than `num_threads=1` and a 2000-variant region 6.6x.
 
 Control the worker count with `num_threads`: `0` (default) auto-detects the core
 count, `1` forces single-threaded decoding, and `N > 1` uses N threads.
@@ -238,9 +238,10 @@ with BgenReader("chr1.bgen", num_threads=8) as reader:
 `gs://` reads go through **obstore**, which does HTTP and TLS in Rust with the GIL
 released, so many range requests are genuinely in flight at once. `s3://` goes
 through **fsspec** (`s3fs`), because obstore's S3 store assumes the `us-east-1`
-region and does not read `~/.aws/credentials`, `AWS_PROFILE` or SSO. Both are
-installed by default and `storage_options` are spelled the same way for either;
-requester-pays works on both.
+region and does not read `~/.aws/credentials`, `AWS_PROFILE` or SSO. obstore and
+gcsfs are installed by default; `s3://` additionally needs
+`pip install lazybgen[s3]`. `storage_options` are spelled the same way for either
+transport, and requester-pays works on both.
 
 `remote_backend` overrides the choice per reader (`"auto"`, `"obstore"`,
 `"fsspec"`), and `LAZYBGEN_REMOTE_BACKEND` does it for a process.
@@ -297,6 +298,10 @@ parentheses:
 | One variant               | **341 ms**       | ~15x (5.2 s)     | ~76x (26 s)     | ~151x (52 s)     |
 | Region (2000 contiguous)  | **5.93 s**       | 0.9x (5.2 s)     | ~4x (26 s)      | ~9x (52 s)       |
 | Scattered (1000 random)   | **3.12 s**       | ~2x (5.2 s)      | ~8x (26 s)      | ~17x (52 s)      |
+
+Only the 9.1 GB download is measured (5.2 s, median of 5); the 26 s and 52 s
+figures scale it by byte size, since download time depends on bytes and not on
+what is in them.
 
 The lazybgen column is one number per row because it does not change with the
 file: the same read costs the same at 10k variants and at 100k. The 0.9x is the

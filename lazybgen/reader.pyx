@@ -736,8 +736,8 @@ cdef class BgenReader:
             return dosages, variant_info
 
         cdef int i, batch_start, batch_end
-        # Process variants in batches for progress reporting cadence. (The previous
-        # dynamic batch size only gated the progress callback; decoding is per-variant.)
+        # Batching here sets the progress-callback cadence only; decoding is
+        # per-variant either way.
         cdef int batch_size
         if n_variants < 1000:
             batch_size = 100

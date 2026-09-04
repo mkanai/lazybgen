@@ -3,11 +3,10 @@
 Why this exists: two lazybgen builds cannot share a process (an editable install's
 meta-path finder wins over a `cd`), so the obvious approach is to run each build's
 remote suite to completion and compare the results. That does not work. A remote
-link drifts far more over minutes than the effects being measured -- the same read
-has measured 180 s, 81 s and 24 s across one day on the same machine -- so two
-suites run minutes apart differ by the weather, not by the code. A comparison
-built that way once produced a confident "3.2x slower" that an interleaved re-run
-turned into "2x faster".
+link drifts far more over minutes than the effects being measured (one read has
+ranged over 180 s, 81 s and 24 s across a day on one machine), so two suites run
+minutes apart differ by the weather rather than by the code, by more than enough
+to invent or hide a 2x.
 
 So this driver alternates. Every configuration runs one timed read, round-robin,
 rep after rep, and only then are medians taken. A drift that hits one arm hits
