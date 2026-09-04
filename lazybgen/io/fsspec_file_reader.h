@@ -45,6 +45,8 @@ class FsspecFileReader : public FileReader {
     // FileReader interface implementation
     size_t read(uint8_t* buffer, size_t size) override;
     size_t read_at(uint64_t offset, uint8_t* buffer, size_t size) override;
+    void read_many(const uint64_t* offsets, const size_t* sizes, uint8_t* const* buffers,
+                   size_t* out_read, size_t count) override;
     void seek(uint64_t offset) override;
     uint64_t tell() const override;
     uint64_t size() const override;
@@ -69,6 +71,12 @@ class FsspecFileReader : public FileReader {
     // Read data using the fsspec backend
     size_t read_internal(uint64_t offset, uint8_t* buffer, size_t size);
 
+    // Fetch one group of ranges through fs.cat_ranges, which puts them in
+    // flight together. Sized by the caller so the bytes it materializes stay
+    // bounded. Requires the GIL to be free (it takes it itself).
+    void fetch_ranges(const uint64_t* offsets, const size_t* sizes, uint8_t* const* buffers,
+                      size_t* out_read, size_t count);
+
     // Buffer management for sequential reads
     void fill_buffer(uint64_t offset);
     size_t read_from_buffer(uint8_t* buffer, size_t size);
@@ -78,6 +86,7 @@ class FsspecFileReader : public FileReader {
     PyObject* fs_;               // FileSystem instance
     PyObject* file_obj_;         // file handle from fs.open()
     PyObject* storage_options_;  // borrowed; kwargs for the FileSystem ctor (may be NULL)
+    bool has_cat_ranges_;        // filesystem exposes the batched range API
 
     // File information
     std::string filename_;

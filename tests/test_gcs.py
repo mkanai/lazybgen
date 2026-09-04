@@ -6,6 +6,7 @@ and does not over-fetch. Run explicitly with ``-m integration``. The mocked,
 network-free BGI cache/download unit tests live in test_bgi_cache.py.
 """
 
+import contextlib
 import warnings
 from pathlib import Path
 
@@ -23,6 +24,37 @@ LOCAL_DATA = Path(__file__).parent / "data"
 # point read must fetch ~one small block, not a large fixed block or the whole
 # file. Public; egress per run is one small block.
 GCS_LARGE_BGEN = "gs://gcs-anndata-test/lazybgen/test_5000s_2000v_zlib_8bit.bgen"
+
+
+@contextlib.contextmanager
+def _counting_gcs_requests():
+    """Count the GCS range requests a block of code makes.
+
+    A block decode fetches its records through the filesystem's batched range
+    API, while a single-record read still goes through the file handle's
+    readahead, so both have to be counted for the total to mean anything.
+    """
+    from gcsfs.core import GCSFile, GCSFileSystem
+
+    calls = {"n": 0}
+    orig_fetch_range = GCSFile._fetch_range
+    orig_cat_file = GCSFileSystem._cat_file
+
+    def counting_fetch_range(self, start, end):
+        calls["n"] += 1
+        return orig_fetch_range(self, start, end)
+
+    async def counting_cat_file(self, path, start=None, end=None, **kwargs):
+        calls["n"] += 1
+        return await orig_cat_file(self, path, start=start, end=end, **kwargs)
+
+    GCSFile._fetch_range = counting_fetch_range
+    GCSFileSystem._cat_file = counting_cat_file
+    try:
+        yield calls
+    finally:
+        GCSFile._fetch_range = orig_fetch_range
+        GCSFileSystem._cat_file = orig_cat_file
 
 
 @pytest.mark.integration
@@ -187,8 +219,6 @@ class TestGCSIntegration:
         """
         import sqlite3
 
-        from gcsfs.core import GCSFile
-
         from lazybgen.remote import ensure_local_bgi
 
         try:
@@ -217,26 +247,54 @@ class TestGCSIntegration:
             "allele2": [p[3] for p in picks],
         }
 
-        calls = {"n": 0}
-        orig = GCSFile._fetch_range
-
-        def counting_fetch_range(self, start, end):
-            calls["n"] += 1
-            return orig(self, start, end)
-
-        GCSFile._fetch_range = counting_fetch_range
-        try:
+        with _counting_gcs_requests() as calls:
             reader = BgenReader(GCS_LARGE_BGEN, bgi_path=GCS_LARGE_BGEN + ".bgi")
             calls["n"] = 0  # isolate the genotype reads from open-time fetches
             dosages, _info = reader.load_variants(variant_filter=vf)
-        finally:
-            GCSFile._fetch_range = orig
 
         n_variants = dosages.shape[1]
         assert n_variants == len(picks)
         # One record read per variant: allow a small slack for an occasional split
-        # block, but stay well under the pre-fix 2/variant.
-        assert calls["n"] <= 1.3 * n_variants, (
+        # block, but stay well under the pre-fix 2/variant. The lower bound keeps
+        # the check honest if the counted call sites ever stop being the ones the
+        # read actually uses.
+        assert 0.9 * n_variants <= calls["n"] <= 1.3 * n_variants, (
             f"scattered read made {calls['n']} range requests for {n_variants} "
             f"variants ({calls['n'] / n_variants:.2f}/variant; expected ~1)"
+        )
+
+    def test_contiguous_region_read_is_coalesced(self):
+        """Records that sit next to each other are fetched together.
+
+        A scattered selection needs one request per variant, but a contiguous
+        region would be pathological that way: the records are adjacent, so they
+        are merged into a handful of large requests instead of hundreds of small
+        ones. Skips if the fixture is unreachable.
+        """
+        import sqlite3
+
+        from lazybgen.remote import ensure_local_bgi
+
+        try:
+            bgi_local = ensure_local_bgi(GCS_LARGE_BGEN + ".bgi")
+            con = sqlite3.connect(bgi_local)
+            rows = list(con.execute("SELECT chromosome, position FROM Variant ORDER BY file_start_position LIMIT 200"))
+            con.close()
+        except Exception as exc:  # noqa: BLE001 - environment/fixture issue -> skip
+            pytest.skip(f"large fixture unavailable: {exc}")
+
+        assert len(rows) >= 100
+        chrom, start = rows[0]
+        end = rows[-1][1]
+
+        with _counting_gcs_requests() as calls:
+            reader = BgenReader(GCS_LARGE_BGEN, bgi_path=GCS_LARGE_BGEN + ".bgi")
+            calls["n"] = 0  # isolate the genotype reads from open-time fetches
+            dosages, _info = reader.load_variants(region_chrom=chrom, region_start=start, region_end=end)
+
+        n_variants = dosages.shape[1]
+        assert n_variants >= 100
+        assert calls["n"] < 0.25 * n_variants, (
+            f"contiguous region made {calls['n']} range requests for {n_variants} "
+            "adjacent variants; adjacent records should be fetched together"
         )

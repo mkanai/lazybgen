@@ -174,15 +174,22 @@ with BgenReader("chr1.bgen", num_threads=8) as reader:
 ## Performance
 
 lazybgen vs the [`bgen`](https://pypi.org/project/bgen/) package reading the same
-local files (16 vCPU / 128 GB VM, median of 3 page-cache-warm runs). Variant count
-fixed at 10k, samples scaling to biobank size; speedup is lazybgen vs bgen,
-parenthetical is lazybgen's wall time:
+local files (16 vCPU / 125 GB n2 VM, median of 3 page-cache-warm runs, 2026-09-02).
+Variant count fixed at 10k, samples scaling to biobank size; speedup is lazybgen
+vs bgen, parenthetical is lazybgen's wall time:
 
 | Workload                 | 5k x 10k (94 MB) | 50k x 10k (931 MB) | 500k x 10k (9.1 GB) |
 |--------------------------|------------------|--------------------|---------------------|
-| Full decode              | 2.6x (0.31 s)    | 3.5x (2.1 s)       | 3.8x (19.4 s)       |
-| Region (500 variants)    | 2.7x (16 ms)     | 3.7x (100 ms)      | 3.7x (1.07 s)       |
-| Scattered (200 variants) | 2.6x (7 ms)      | 3.3x (51 ms)       | 3.3x (486 ms)       |
+| Full decode              | 3.3x (265 ms)    | 8.3x (980 ms)      | 14.5x (5.36 s)      |
+| Region (500 variants)    | 5.7x (8 ms)      | 6.6x (68 ms)       | 10.4x (417 ms)      |
+| Scattered (200 variants) | 3.3x (7 ms)      | 5.0x (38 ms)       | 6.9x (254 ms)       |
+
+A local file is memory-mapped and read in place, so a partial read holds only the
+matrix it returns: at 500k samples the region and scattered reads above peak at
+178 MB and 187 MB, against 2.1 GB and 933 MB for the same reads through `bgen`.
+A single-variant lookup is the one workload lazybgen does not win, because it is
+dominated by opening the reader; hold a `BgenReader` open across lookups instead
+of calling `load_bgen` per variant.
 
 ### Remote: lazy partial reads at biobank scale
 
@@ -194,16 +201,17 @@ time stays flat while the download baseline grows. At 500k samples:
 
 | Read (500k samples)      | lazybgen `gs://` | 10k var (9.1 GB) | 50k var (45 GB) | 100k var (91 GB) |
 |--------------------------|------------------|------------------|-----------------|------------------|
-| One variant              | **0.32 s**       | ~25x (8 s)       | ~100x (33 s)    | ~265x (85 s)     |
-| Region (500 contiguous)  | **5.4 s**        | ~2.2x (12 s)     | ~6.9x (37 s)    | ~17x (89 s)      |
-| Scattered (200 random)   | **12.1 s**       | ~0.8x (10 s)     | ~2.9x (35 s)    | ~7x (87 s)       |
+| One variant              | **0.50 s**       | ~16x (8 s)       | ~67x (33 s)     | ~172x (85 s)     |
+| Region (500 contiguous)  | **3.9 s**        | ~3x (12 s)       | ~10x (37 s)     | ~23x (89 s)      |
+| Scattered (200 random)   | **1.5 s**        | ~6x (10 s)       | ~23x (35 s)     | ~57x (87 s)      |
 
 Each cell is the end-to-end speedup, with the download-then-read baseline time in
-parentheses (whole-file `gcloud storage cp` + bgen's local read). All three
-download sizes are measured (same-region, ~1.2 GB/s); lazybgen's partial-read
-times are measured and size-invariant. This is **best-case for the download**
-(fast same-region link, free egress), so a laptop/cross-region/metered link
-widens every gap. See
+parentheses (whole-file `gcloud storage cp` + bgen's local read). lazybgen's
+partial-read times are measured and size-invariant; the download times they are
+compared against are carried forward from an earlier same-region measurement
+(~1.2 GB/s), since they time the transfer rather than either reader. This is
+**best-case for the download** (fast same-region link, free egress), so a
+laptop/cross-region/metered link widens every gap. See
 [benchmarks/README.md](benchmarks/README.md#lazybgen-vs-the-bgen-package) for the
 full size ladder, wall times, invariance check, and methodology.
 

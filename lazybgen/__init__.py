@@ -106,8 +106,10 @@ def _validate_dosages(dosages) -> bool:
 def _check_dosage_range(min_dosage, max_dosage) -> None:
     """Raise if the observed dosage bounds fall outside [0, 2].
 
-    Both bounds ignore missing calls, so an all-missing result arrives as
-    inf / -inf and correctly passes: there is no real value to be out of range.
+    Both bounds ignore missing calls, so an all-missing result has no real value
+    to be out of range and correctly passes: it arrives as inf / -inf from the
+    reader's own summary, or as NaN from nanmin / nanmax, and neither compares
+    true against the bounds.
     """
     if min_dosage < 0.0 or max_dosage > 2.0:
         raise ValueError(

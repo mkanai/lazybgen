@@ -10,9 +10,30 @@ from distutils.ccompiler import new_compiler
 from pathlib import Path
 
 import numpy as np
+import setuptools
 from Cython.Build import cythonize
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
+
+# pyproject.toml states its license in the PEP 639 form (`license = "MIT"` plus
+# `license-files`), which setuptools understands from 77 on. A PEP 517 build
+# (`pip install .`, `python -m build`) provisions that itself from
+# [build-system].requires, but `python setup.py ...` runs against whatever
+# setuptools the environment already has. An older one fails deep inside setup()
+# with a JSON-schema dump that never mentions the version, so say it here.
+MIN_SETUPTOOLS = 77
+try:
+    _setuptools_major = int(setuptools.__version__.split(".")[0])
+except (AttributeError, ValueError):  # unrecognizable version: let the build try
+    _setuptools_major = MIN_SETUPTOOLS
+if _setuptools_major < MIN_SETUPTOOLS:
+    raise SystemExit(
+        f"lazybgen needs setuptools >= {MIN_SETUPTOOLS} to read pyproject.toml "
+        f"(found {setuptools.__version__}).\n"
+        f"  python -m pip install --upgrade 'setuptools>={MIN_SETUPTOOLS}'\n"
+        "Or build through pip, which provisions the right version itself:\n"
+        "  python -m pip install ."
+    )
 
 # Determine platform-specific compile args.
 # Do NOT add -ffast-math here: it implies -ffinite-math-only, which lets the
@@ -263,6 +284,11 @@ def get_build_info():
             print("Using system libraries as requested via LAZYBGEN_USE_SYSTEM_LIBS")
             for ext in self.extensions:
                 if "bgen" in ext.name:
+                    # Drop the vendored include paths: libdeflate ships its header
+                    # in the source tree, so leaving it on the search path would
+                    # compile against the vendored declarations while linking the
+                    # system library.
+                    ext.include_dirs = [d for d in ext.include_dirs if "libdeflate" not in d and "zstd/lib" not in d]
                     ext.libraries.extend(["deflate", "zstd"])
 
             self._write_build_config("system")

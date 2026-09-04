@@ -36,6 +36,7 @@ byte-range reads. It was extracted from
 - Vendored, statically linked libdeflate and zstd for consistent cross-platform
   decompression; ships a `py.typed` marker and prebuilt wheels
   (manylinux/musllinux x86_64, macOS arm64). `get_build_info()` reports the
-  compression backend the package was built against.
+  compression backend the package was built against, under the keys `type`,
+  `deflate`, `zstd` and `note`.
 
 [0.1.0]: https://github.com/mkanai/lazybgen/releases/tag/v0.1.0

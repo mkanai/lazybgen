@@ -20,8 +20,10 @@ we want when optimizing lazybgen.
   `python benchmarks/run_remote_benchmark.py --smoke`. Full run (uploads the
   fixtures to a GCS bucket first, then measures):
   `python benchmarks/run_remote_benchmark.py --upload --strategies stream,download_then_read,warm_local --prefetch-sweep`.
-- `Dockerfile.benchmark` - builds lazybgen from any commit (submodules + CMake
-  vendored zlib-ng/zstd + in-place extension build).
+- `Dockerfile.benchmark` - builds lazybgen from any commit (vendored compression
+  submodules + in-place extension build). It still installs CMake, because
+  commits from before the switch to libdeflate build their vendored zlib with
+  it; current commits compile every vendored library directly.
 - `benchmark_commits.sh` - builds an image per commit and runs the benchmark.
 - `compare_results.py` - tables, CSV, plots, and regression detection across runs.
 - `analyze_profiles.py` - turns `--profile` output into reports / call graphs.
@@ -65,11 +67,12 @@ dtype: lazybgen materializes its `(samples, variants)` output in one C++ call;
 the `bgen` package exposes one variant at a time, so its equivalent fills the
 matrix one variant at a time. Wall time and peak RSS are therefore comparable.
 
-**Setup.** Measured on a 16 vCPU / 128 GB n2 VM, so the 37 GB full-decode
-materialization at 500k x 10k fits without hitting a RAM ceiling. Page-cache-warm;
-median of 3 runs after 1 warmup; synthetic zlib / 8-bit fixtures from
-`generate_test_bgen.py`. lazybgen uses its default parallel decode (auto-detected
-cores); the `bgen` package decodes one variant at a time in Rust. Reproduce with:
+**Setup.** Measured 2026-09-02 on a 16 vCPU / 125 GB n2 VM (Xeon 2.80 GHz), so
+the 37 GB full-decode materialization at 500k x 10k fits without hitting a RAM
+ceiling. Page-cache-warm; median of 3 runs after 1 warmup; synthetic zlib / 8-bit
+fixtures from `generate_test_bgen.py`; `bgen` 1.9.0. lazybgen uses its default
+parallel decode (auto-detected cores); the `bgen` package decodes one variant at
+a time in Rust. Reproduce with:
 
 ```bash
 python benchmarks/compare_libraries.py \
@@ -84,36 +87,47 @@ Speedup is bgen time / lazybgen time (>1 means lazybgen is faster):
 
 | samples (x 10k var) | file    | full_decode | region | scattered | single |
 |---------------------|---------|-------------|--------|-----------|--------|
-| 500                 | 11 MB   | 1.9x        | 0.8x   | 0.5x      | 0.1x   |
-| 1k                  | 20 MB   | 2.7x        | 2.4x   | 1.6x      | 0.4x   |
-| 5k                  | 94 MB   | 2.6x        | 2.7x   | 2.6x      | 0.7x   |
-| 10k                 | 187 MB  | 2.5x        | 2.6x   | 3.0x      | 0.9x   |
-| 50k                 | 931 MB  | 3.5x        | 3.7x   | 3.3x      | 1.3x   |
-| 100k                | 1.86 GB | 4.0x        | 4.1x   | 3.9x      | 1.4x   |
-| 500k                | 9.1 GB  | 3.8x        | 3.7x   | 3.3x      | 1.5x   |
+| 500                 | 11 MB   | 2.5x        | 2.0x   | 1.3x      | 0.3x   |
+| 1k                  | 20 MB   | 3.3x        | 2.5x   | 1.8x      | 0.5x   |
+| 5k                  | 94 MB   | 3.3x        | 5.7x   | 3.3x      | 0.8x   |
+| 10k                 | 187 MB  | 3.7x        | 3.0x   | 4.6x      | 1.0x   |
+| 50k                 | 931 MB  | 8.3x        | 6.6x   | 5.0x      | 1.2x   |
+| 100k                | 1.86 GB | 10.9x       | 8.5x   | 5.8x      | 1.2x   |
+| 500k                | 9.1 GB  | 14.5x       | 10.4x  | 6.9x      | 1.2x   |
 
 lazybgen wall time at the same points (median of 3):
 
 | samples | full_decode | region (500 var) | scattered (200 var) | single |
 |---------|-------------|------------------|---------------------|--------|
-| 500     | 63 ms       | 10 ms            | 10 ms               | 7 ms   |
-| 5k      | 312 ms      | 16 ms            | 7 ms                | 3 ms   |
-| 50k     | 2.12 s      | 100 ms           | 51 ms               | 11 ms  |
-| 100k    | 3.94 s      | 192 ms           | 88 ms               | 21 ms  |
-| 500k    | 19.4 s      | 1.07 s           | 486 ms              | 100 ms |
+| 500     | 59 ms       | 5 ms             | 5 ms                | 2 ms   |
+| 1k      | 85 ms       | 6 ms             | 5 ms                | 2 ms   |
+| 5k      | 265 ms      | 8 ms             | 7 ms                | 3 ms   |
+| 10k     | 498 ms      | 29 ms            | 9 ms                | 4 ms   |
+| 50k     | 980 ms      | 68 ms            | 38 ms               | 16 ms  |
+| 100k    | 1.46 s      | 104 ms           | 62 ms               | 31 ms  |
+| 500k    | 5.36 s      | 417 ms           | 254 ms              | 150 ms |
 
-lazybgen wins by 2.5-4x from ~5k samples up, and the lead grows with sample count
-(the parallel decode has more to chew on). The exception is the smallest
-**500-sample** fixtures: those reads are a few milliseconds, dominated by
-lazybgen's fixed reader/index setup (~7 ms), so the `bgen` package's lighter open
-wins the slice workloads there. full_decode still wins at every size (1.9-4.0x).
+The lead grows with sample count, from ~2.5x at 500 samples to 14.5x at 500k: the
+parallel decode has more to chew on, and the per-read fixed costs stop mattering.
+Two exceptions worth knowing:
 
-**Peak memory / full materialization.** Both readers are dominated by the output
-matrix. `full_decode` materializes the entire `(samples, variants)` float64 array
-- 37 GB at 500k x 10k - so it needs a host with comparable RAM (hence the 128 GB
-VM). On a memory-constrained box, read a region or stream with `iter_variants`
-instead of materializing everything; those paths are memory-bounded and are where
-the realistic large-file workloads live anyway.
+- **`single` is not a win.** One variant is a few milliseconds of real work, so it
+  is dominated by opening the reader, and `load_bgen` builds the sample-ID list
+  before it returns. Below ~10k samples the `bgen` package's lighter open beats
+  us; above it we are level. If you want single-variant lookups to be cheap, hold
+  one `BgenReader` open across them rather than calling `load_bgen` per variant.
+- **The 500-sample fixtures** are small enough that all four workloads are a few
+  milliseconds end to end, so treat that row as noise-adjacent.
+
+**Peak memory.** A local file is memory-mapped and read in place, so a partial
+read holds only the matrix it returns - at 500k samples, 178 MB for the
+500-variant region and 187 MB for the 200-variant scattered read, against 2.1 GB
+and 933 MB for the same reads through `bgen`. `full_decode` is the opposite case:
+it materializes the entire `(samples, variants)` float64 array, 37 GB at
+500k x 10k (lazybgen peaks at 47.6 GB including per-thread decode buffers, `bgen`
+at 38.3 GB), so it needs a host with comparable RAM. On a memory-constrained box
+read a region or stream with `iter_variants`; those paths are memory-bounded and
+are where the realistic large-file workloads live anyway.
 
 ### Remote (`gs://`): lazy partial reads at biobank scale
 
@@ -126,29 +140,37 @@ bucket, median of 3):
 
 | Read                     | lazybgen, direct from `gs://` |
 |--------------------------|-------------------------------|
-| One variant              | 0.32 s                        |
-| Region (500 contiguous)  | 5.38 s                        |
-| Scattered (200 random)   | 12.06 s                       |
+| One variant              | 0.50 s                        |
+| Region (500 contiguous)  | 3.91 s                        |
+| Scattered (200 random)   | 1.52 s                        |
 
 Because lazybgen fetches only the requested variants, these times are independent
-of the total variant count (file size); `scattered` is the slowest because it is
-200 *sequential* byte-range round-trips. The download-then-read baseline, by
-contrast, grows linearly with the file. Against the measured same-region
-`gcloud storage cp` download (9.1 / 45 / 91 GB took 8 / 33 / 85 s, ~1.2 GB/s) plus
-bgen's local read, the end-to-end speedup of lazybgen's direct read is:
+of the total variant count (file size). A block decode asks for a whole block's
+records in one batched request and merges the ones that sit next to each other,
+so a scattered read is 200 *concurrent* range requests rather than 200 sequential
+round-trips. That is why the contiguous region is the slower of the two here: at
+500k samples its 500 records are ~500 MB to move, so it is bound by bandwidth
+rather than by latency. The download-then-read baseline, by contrast, grows
+linearly with the whole file:
 
 | Read (500k samples)      | lazybgen `gs://` | 10k var (9.1 GB) | 50k var (45 GB) | 100k var (91 GB) |
 |--------------------------|------------------|------------------|-----------------|------------------|
-| One variant              | 0.32 s           | ~25x             | ~100x           | ~265x            |
-| Region (500 contiguous)  | 5.38 s           | ~2.2x            | ~6.9x           | ~17x             |
-| Scattered (200 random)   | 12.06 s          | ~0.8x            | ~2.9x           | ~7x              |
+| One variant              | 0.50 s           | ~16x             | ~67x            | ~172x            |
+| Region (500 contiguous)  | 3.91 s           | ~3x              | ~10x            | ~23x             |
+| Scattered (200 random)   | 1.52 s           | ~6x              | ~23x            | ~57x             |
 
-All three download sizes are measured (the 45 and 91 GB objects built by composing
-the 9.1 GB file, since download time depends only on byte size); lazybgen's
-partial-read times are measured and size-invariant. The crossover is the point: on
-a 9 GB file a bulk download on this fast link is cheap enough that 200 scattered
-round-trips roughly break even, but as the file grows to tens or hundreds of GB
-lazybgen wins every partial read - increasingly so with size.
+lazybgen's partial-read times were measured 2026-09-02 and are size-invariant.
+The whole-file download times they are compared against (9.1 / 45 / 91 GB in
+8 / 33 / 85 s, ~1.2 GB/s same-region; the 45 and 91 GB objects built by composing
+the 9.1 GB file, since download time depends only on byte size) were measured
+2026-06-23 and carried forward, because they time the transfer rather than either
+reader. Each baseline cell is that download plus bgen's local read of the same
+selection.
+
+lazybgen now wins every partial read at every size on this list, and by more as
+the file grows. That was not true before the batched range fetch: a scattered
+read of 200 variants used to cost 200 sequential round-trips and roughly broke
+even with a bulk download of a 9 GB file.
 
 Two caveats, both in the baseline's favor (so the real-world advantage is
 larger): this is **best-case for the download** (~1.2 GB/s, same-region, free
@@ -162,6 +184,10 @@ python benchmarks/compare_libraries.py --skip-local \
     --remote-bucket gs://your-bucket/lazybgen-bench \
     --output benchmarks/compare_results_remote.json
 ```
+
+The default 24 GB `--max-full-gb` cap deliberately skips the remote `full_decode`
+at 500k x 10k: it would refetch 9.1 GB per run to materialize a 37 GB matrix, and
+none of the tables above use it.
 
 ## Quick start
 

@@ -2,7 +2,7 @@
 #
 # Stage 1 checks out the requested commit from the build context (the repo,
 # including .git and the populated submodule working trees) and re-materializes
-# the vendored submodules (zlib-ng, zstd) pinned by that commit.
+# the vendored compression submodules pinned by that commit.
 # Stage 2 builds the Cython/C++ extension in place and runs the benchmark.
 #
 # The benchmark script itself is NOT baked in: benchmark_commits.sh bind-mounts
@@ -22,13 +22,15 @@ RUN if [ -d .git ]; then \
         git log -1 --format="%H %cd %s" --date=iso-strict > /tmp/COMMIT_INFO.txt && \
         git rev-parse HEAD > /tmp/COMMIT_HASH.txt && \
         git clean -fdx && \
-        # Re-materialize vendored submodules for this commit (zlib-ng, zstd).
+        # Re-materialize the vendored submodules this commit pins.
         git submodule update --init --recursive; \
     else \
         echo "ERROR: No .git directory found" && exit 1; \
     fi
 
 FROM python:3.11-slim
+# CMake is here for older commits only: those built their vendored zlib with it.
+# Current commits compile every vendored library directly and never invoke it.
 RUN apt-get update && apt-get install -y \
         gcc g++ cmake make \
         sqlite3 libsqlite3-dev \

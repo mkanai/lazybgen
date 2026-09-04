@@ -13,6 +13,7 @@ Tests are organized into logical sections:
 
 import gc
 import logging
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -1188,3 +1189,66 @@ def test_nonexistent_sample_file_raises_at_open(test_paths, tmp_path):
     """A missing .sample file is reported when the reader is opened, not later."""
     with pytest.raises(FileNotFoundError):
         BgenReader(str(test_paths["bgen_file"]), sample_path=str(tmp_path / "nope.sample"))
+
+
+def test_relative_sample_path_survives_a_chdir(test_paths, tmp_path, monkeypatch):
+    """A relative sample_path is anchored at construction, not at first access.
+
+    Sample IDs are parsed on demand, so a relative path re-resolved at access
+    time would follow the process's current directory. If another file happened
+    to sit at the same relative path, the reader would return that file's IDs
+    and silently map genotype columns to the wrong samples.
+    """
+    sample_file = Path(test_paths["sample_file"])
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    shutil.copy(sample_file, workdir / "data.sample")
+
+    decoy_dir = tmp_path / "decoy"
+    decoy_dir.mkdir()
+    (decoy_dir / "data.sample").write_text("ID_1 ID_2 missing\n0 0 0\nDECOY DECOY 0\n")
+
+    monkeypatch.chdir(workdir)
+    reader = BgenReader(str(test_paths["bgen_file"]), sample_path="data.sample")
+    monkeypatch.chdir(decoy_dir)
+    try:
+        assert reader.samples[0] != "DECOY"
+        assert len(reader.samples) == reader.nsamples
+    finally:
+        reader.close()
+
+
+def test_repeated_readers_reuse_a_parsed_sample_file(test_paths, tmp_path):
+    """Parsing the same .sample file again is avoided, but never at the cost of
+    correctness: the list handed out is the caller's own, and a changed file is
+    re-read."""
+    sample_file = tmp_path / "cohort.sample"
+    shutil.copy(Path(test_paths["sample_file"]), sample_file)
+
+    with BgenReader(str(test_paths["bgen_file"]), sample_path=str(sample_file)) as r1:
+        first = r1.samples
+    with BgenReader(str(test_paths["bgen_file"]), sample_path=str(sample_file)) as r2:
+        second = r2.samples
+    assert first == second
+    # Each reader owns its list; mutating one must not reach the next.
+    assert first is not second
+    second[0] = "MUTATED"
+    with BgenReader(str(test_paths["bgen_file"]), sample_path=str(sample_file)) as r3:
+        assert r3.samples[0] == first[0]
+
+
+def test_rewritten_sample_file_is_not_served_from_a_stale_parse(test_paths, tmp_path):
+    """A .sample file edited between reads yields the new IDs, not the old ones."""
+    sample_file = tmp_path / "cohort.sample"
+    shutil.copy(Path(test_paths["sample_file"]), sample_file)
+    with BgenReader(str(test_paths["bgen_file"]), sample_path=str(sample_file)) as reader:
+        original = reader.samples
+    assert original[0] != "REWRITTEN_0"
+
+    n = len(original)
+    rows = "\n".join(f"REWRITTEN_{i} REWRITTEN_{i} 0" for i in range(n))
+    sample_file.write_text(f"ID_1 ID_2 missing\n0 0 0\n{rows}\n")
+
+    with BgenReader(str(test_paths["bgen_file"]), sample_path=str(sample_file)) as reader:
+        assert reader.samples[0] == "REWRITTEN_0"
+        assert len(reader.samples) == n

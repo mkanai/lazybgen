@@ -440,6 +440,14 @@ def _build_argparser():
 
 def main(argv=None):
     args = _build_argparser().parse_args(argv)
+    # DEFAULT_BUCKET is a placeholder, not a real location. Say so plainly rather
+    # than letting the first range request fail with a bucket-not-found error.
+    if args.bucket == DEFAULT_BUCKET and not args.smoke:
+        raise SystemExit(
+            f"--bucket is required: {DEFAULT_BUCKET} is a placeholder. Pass a bucket "
+            "you can write to, e.g. --bucket gs://my-bucket/lazybgen-bench "
+            "(or use --smoke to run against the small public fixture)."
+        )
     storage_options = parse_storage_options(args.storage_options, args.requester_pays)
     reader_mod = __import__("lazybgen", fromlist=["load_bgen", "BgenReader"])
     # Install before any reader opens a remote file, so range GETs are counted

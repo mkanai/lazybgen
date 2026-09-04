@@ -4,6 +4,7 @@
 #include <Python.h>
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -49,9 +50,12 @@ struct BgenHeader {
  * same answers is gigabytes of DRAM traffic per read at biobank scale.
  */
 struct DosageStats {
-    double min_value;
-    double max_value;
-    bool has_nan;
+    // Defaulted so a value-initialized instance (an unwritten slot in the
+    // per-variant array a block decode fills) is the identity for the fold
+    // rather than a zero that would clamp the range to include 0.
+    double min_value = std::numeric_limits<double>::infinity();
+    double max_value = -std::numeric_limits<double>::infinity();
+    bool has_nan = false;
 };
 
 class BgenReaderImpl {

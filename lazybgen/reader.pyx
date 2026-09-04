@@ -41,6 +41,21 @@ logger = logging.getLogger(__name__)
 np.import_array()
 
 
+# Most recently parsed .sample file: {(path, mtime_ns, size): tuple(ids)}.
+# Keyed on the file's identity and a content stamp, so an edited file is re-read
+# rather than served stale. Holds one entry; see _load_samples_from_file.
+_SAMPLE_ID_CACHE = {}
+
+
+def _sample_file_key(sample_path):
+    """Identity + content stamp for a .sample file, or None if it cannot be stat'd."""
+    try:
+        st = os.stat(sample_path)
+    except OSError:
+        return None
+    return (sample_path, st.st_mtime_ns, st.st_size)
+
+
 cdef class BgenReader:
     """
     High-performance BGEN file reader with C++ integration.
@@ -80,7 +95,10 @@ cdef class BgenReader:
         self.bgi_path = bgi_path or (file_path + '.bgi')
         self.storage_options = storage_options
         self.is_open = False
-        self.sample_path = sample_path
+        # Anchored at construction: the rows are parsed on first access to the
+        # `samples` property, so a relative path left unresolved would follow the
+        # process's current directory to whatever file sits there by then.
+        self.sample_path = os.path.abspath(sample_path) if sample_path else None
         # Sample IDs are materialized on first access (see the `samples`
         # property). At biobank scale building them is hundreds of thousands of
         # Python strings, which a read that never asks for sample IDs should not
@@ -118,7 +136,7 @@ cdef class BgenReader:
         # Only the two mandated header lines are read here; the per-sample rows
         # are parsed on demand.
         if sample_path:
-            self._check_sample_file(sample_path)
+            self._check_sample_file(self.sample_path)
     
     cdef void _init_reader(self) except *:
         """Initialize C++ reader components."""
@@ -154,9 +172,11 @@ cdef class BgenReader:
         """Validate a .sample file's header without parsing its rows.
 
         The .sample format mandates two header lines (column names, then column
-        types) before the per-sample rows. Reading just those two makes a missing
-        or truncated file fail at open, while leaving the per-sample rows (which
-        dominate the cost at biobank scale) to _load_samples_from_file.
+        types) before the per-sample rows. Reading just those two catches a
+        missing or truncated file at open, while leaving the per-sample rows
+        (which dominate the cost at biobank scale) to _load_samples_from_file.
+        Only the file's state at open is checked; a file removed or truncated
+        afterwards surfaces when the rows are read.
         """
         with open(sample_path, 'r') as f:
             if not f.readline() or not f.readline():
@@ -166,6 +186,19 @@ cdef class BgenReader:
 
     def _load_samples_from_file(self, sample_path: str):
         """Load sample IDs from .sample file."""
+        # Reuse the last file parsed, if this is that same file unchanged.
+        # Parsing is ~500K Python strings at biobank scale and dominates a
+        # load_bgen call that reads only a handful of variants, so a loop of
+        # loads over one cohort would otherwise repeat it every time.
+        cache_key = _sample_file_key(sample_path)
+        if cache_key is not None:
+            cached = _SAMPLE_ID_CACHE.get(cache_key)
+            if cached is not None:
+                # A fresh list each time: the caller owns what it is handed and
+                # may mutate it, which must not reach the next reader.
+                self.sample_ids = list(cached)
+                return
+
         with open(sample_path, 'r') as f:
             # Skip the two header lines validated at open.
             if not f.readline() or not f.readline():
@@ -181,6 +214,12 @@ cdef class BgenReader:
                 for parts in (line.split(None, 2) for line in f)
                 if len(parts) >= 2
             ]
+
+        if cache_key is not None:
+            # One file only: the pattern this serves is repeated loads over a
+            # single cohort, and the IDs are tens of megabytes to hold.
+            _SAMPLE_ID_CACHE.clear()
+            _SAMPLE_ID_CACHE[cache_key] = tuple(self.sample_ids)
 
     cdef void _load_samples(self) except *:
         """Materialize the sample IDs from whichever source was configured."""

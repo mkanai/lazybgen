@@ -444,8 +444,11 @@ class BgenReaderImpl::Impl {
             buffer.resize(metadata.variant_size);
             if (file_reader_->read_at(metadata.file_offset, buffer.data(), metadata.variant_size) !=
                 got) {
+                // BGI-sourced metadata carries no varid, so identify the record
+                // by where it starts as well.
                 throw std::runtime_error("Failed to read complete variant record for variant " +
-                                         metadata.varid);
+                                         metadata.varid + " at offset " +
+                                         std::to_string(metadata.file_offset));
             }
             record = buffer.data();
         }
@@ -487,8 +490,9 @@ class BgenReaderImpl::Impl {
         return DosageStats{lo, hi, nan_seen};
     }
 
-    // Fold per-variant summaries into one. An untouched entry contributes
-    // +inf/-inf, which leaves the combined bounds unchanged.
+    // Fold per-variant summaries into one. DosageStats defaults to +inf/-inf,
+    // so an entry no worker wrote leaves the combined bounds unchanged instead
+    // of dragging them toward zero.
     static DosageStats combine_dosage_stats(const std::vector<DosageStats>& parts) {
         DosageStats out{std::numeric_limits<double>::infinity(),
                         -std::numeric_limits<double>::infinity(), false};
@@ -532,22 +536,52 @@ class BgenReaderImpl::Impl {
         // from the decompress:: one this method is parameterized on).
         const auto fmt_comp = static_cast<CompressionType>(header_.compression);
         std::vector<CompressedJob> jobs(n_variants);
+
+        // One-GET path: take each whole record (variant_size bytes at
+        // file_offset) and parse the ID block in-buffer to locate the genotype
+        // slice, so a scattered remote read costs 1 GET/variant.
+        //
+        // Records the reader can show us in place cost nothing; the rest are
+        // fetched in a single read_many so a remote store has them all in flight
+        // at once instead of paying one round trip after another.
+        std::vector<const uint8_t*> records(n_variants, nullptr);
+        std::vector<uint64_t> fetch_offsets;
+        std::vector<size_t> fetch_sizes;
+        std::vector<uint8_t*> fetch_buffers;
+        std::vector<size_t> fetch_indices;
+        for (size_t i = 0; i < n_variants; ++i) {
+            const VariantMetadata& md = block[i];
+            records[i] = file_reader_->view_at(md.file_offset, md.variant_size);
+            if (!records[i]) {
+                jobs[i].raw.resize(md.variant_size);
+                fetch_offsets.push_back(md.file_offset);
+                fetch_sizes.push_back(md.variant_size);
+                fetch_buffers.push_back(jobs[i].raw.data());
+                fetch_indices.push_back(i);
+            }
+        }
+        if (!fetch_indices.empty()) {
+            std::vector<size_t> bytes_read(fetch_indices.size(), 0);
+            file_reader_->read_many(fetch_offsets.data(), fetch_sizes.data(), fetch_buffers.data(),
+                                    bytes_read.data(), fetch_indices.size());
+            for (size_t k = 0; k < fetch_indices.size(); ++k) {
+                const size_t i = fetch_indices[k];
+                if (bytes_read[k] != fetch_sizes[k]) {
+                    // BGI-sourced metadata carries no varid, so identify the
+                    // record by where it starts as well.
+                    throw std::runtime_error("Failed to read complete variant record for variant " +
+                                             block[i].varid + " at offset " +
+                                             std::to_string(block[i].file_offset));
+                }
+                records[i] = jobs[i].raw.data();
+            }
+        }
+
         for (size_t i = 0; i < n_variants; ++i) {
             const VariantMetadata& md = block[i];
             CompressedJob& j = jobs[i];
-            // One-GET path: take the whole record (variant_size bytes at
-            // file_offset) and parse the ID block in-buffer to locate the genotype
-            // slice, so a scattered remote read costs 1 GET/variant.
             const size_t got = md.variant_size;
-            const uint8_t* record = file_reader_->view_at(md.file_offset, md.variant_size);
-            if (!record) {
-                j.raw.resize(md.variant_size);
-                if (file_reader_->read_at(md.file_offset, j.raw.data(), md.variant_size) != got) {
-                    throw std::runtime_error("Failed to read complete variant record for variant " +
-                                             md.varid);
-                }
-                record = j.raw.data();
-            }
+            const uint8_t* record = records[i];
             auto pr = VariantParser::parse(record, got, layout, fmt_comp, n_samples);
             size_t goff = pr.first.genotype_offset;
             size_t glen = pr.first.genotype_length;
