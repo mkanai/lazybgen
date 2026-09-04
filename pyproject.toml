@@ -126,13 +126,18 @@ markers = [
 # is provisioned under isolation. Vendored libdeflate/zstd come from the
 # recursive submodule checkout in the workflow.
 build-frontend = "build"
-# cibuildwheel builds CPython only by default (PyPy is opt-in via `enable`), so
-# only the 32-bit / Windows targets need skipping here.
-# cp314t (free-threaded) is skipped for now: the extension does not yet declare
-# free-threading support (it would re-enable the GIL on import), and validating
-# real no-GIL thread-safety is deferred to a later release. Free-threaded users
-# can still build from the sdist.
-skip = ["cp314t-*", "*-musllinux_i686", "*_i686", "*-win32"]
+# The Python versions are listed explicitly rather than left to cibuildwheel's
+# default set, and they match the classifiers above. Relying on the default meant
+# a cibuildwheel upgrade silently added a target mid-release: 4.2.0 introduced
+# CPython 3.15, whose dependency wheels do not exist yet, so the wheel test had
+# to build cryptography, grpcio and pandas from source and then failed for want
+# of a Rust OpenSSL toolchain. Adding a Python here is a deliberate act.
+build = ["cp310-*", "cp311-*", "cp312-*", "cp313-*", "cp314-*"]
+# Free-threaded builds are skipped by pattern, not by naming one version, for the
+# same reason: the extension does not declare free-threading support (it would
+# re-enable the GIL on import), and validating real no-GIL thread-safety is
+# deferred to a later release. Free-threaded users can still build from the sdist.
+skip = ["cp3*t-*", "*-musllinux_i686", "*_i686", "*-win32"]
 # Smoke test each built wheel: importing the compiled extensions proves the
 # wheel links its bundled libdeflate/zstd/sqlite correctly in a clean environment.
 test-command = "python -c \"import lazybgen; from lazybgen import load_bgen, BgenReader, load_variant_filter, reader; print('wheel import OK')\""
