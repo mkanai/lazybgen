@@ -79,8 +79,8 @@ def _impute_nan_with_mean(
 
     The missing cells of ``dosages`` are overwritten with their per-variant mean
     (and the array is returned), so the only large temporary is the boolean NaN
-    mask. The earlier implementation went through ``np.nanmean`` (which copies the
-    whole array) and ``np.where`` (which allocates a whole new array), i.e. ~2x the
+    mask. Going through ``np.nanmean`` (which copies the whole array) and
+    ``np.where`` (which allocates a whole new array) would cost ~2x the
     matrix in temporaries; on a biobank-scale cohort with missing genotypes that
     is enough to exhaust memory. Computing the column sums/counts directly and
     scattering with ``np.copyto`` keeps peak memory at one extra mask.

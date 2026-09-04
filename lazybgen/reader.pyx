@@ -16,7 +16,7 @@ import pandas as pd
 from typing import Optional, List, Tuple, Dict, Any, Callable, Union
 import logging
 
-from .remote import is_remote_path, choose_remote_block_size
+from .remote import is_remote_path, choose_remote_block_size, resolve_remote_backend
 from .region import validate_region_bounds
 
 
@@ -41,6 +41,21 @@ logger = logging.getLogger(__name__)
 np.import_array()
 
 
+# Most recently parsed .sample file: {(path, mtime_ns, size): tuple(ids)}.
+# Keyed on the file's identity and a content stamp, so an edited file is re-read
+# rather than served stale. Holds one entry; see _load_samples_from_file.
+_SAMPLE_ID_CACHE = {}
+
+
+def _sample_file_key(sample_path):
+    """Identity + content stamp for a .sample file, or None if it cannot be stat'd."""
+    try:
+        st = os.stat(sample_path)
+    except OSError:
+        return None
+    return (sample_path, st.st_mtime_ns, st.st_size)
+
+
 cdef class BgenReader:
     """
     High-performance BGEN file reader with C++ integration.
@@ -52,7 +67,8 @@ cdef class BgenReader:
     def __init__(self, file_path: str, bgi_path: Optional[str] = None,
                  sample_path: Optional[str] = None,
                  num_threads: int = 0,
-                 storage_options: Optional[dict] = None):
+                 storage_options: Optional[dict] = None,
+                 remote_backend: Optional[str] = None):
         """
         Initialize BGEN reader.
 
@@ -75,12 +91,44 @@ cdef class BgenReader:
             for public S3, or for GCS requester-pays buckets {"requester_pays": True}
             to bill the environment's default project or {"requester_pays":
             "billing-project-id"} to bill a specific one). Ignored for local files.
+        remote_backend : str, optional
+            Transport for gs:// and s3:// reads: "obstore", "fsspec" (gcsfs /
+            s3fs), or "auto". "auto" (the default, overridable with the
+            LAZYBGEN_REMOTE_BACKEND environment variable) uses obstore for gs://
+            when it is installed, usable in this process, and can express every
+            storage_options entry, and fsspec otherwise; s3:// stays on s3fs
+            unless "obstore" is asked for explicitly. obstore moves several times
+            more bytes per second per
+            process, because it runs HTTP and TLS outside the GIL rather than
+            through fsspec's single event loop. Ignored for local files.
         """
         self.file_path = file_path
         self.bgi_path = bgi_path or (file_path + '.bgi')
         self.storage_options = storage_options
+        # Resolved once here rather than per read, so every path of one reader
+        # (index download, header parse, genotype fetch) uses the same transport.
+        # Resolve against whichever path is actually remote: a local BGEN with a
+        # remote .bgi would otherwise hand a filesystem path to the scheme parser.
+        _remote_path = (
+            file_path if is_remote_path(file_path)
+            else (self.bgi_path if is_remote_path(self.bgi_path) else None)
+        )
+        self.remote_backend = (
+            resolve_remote_backend(_remote_path, storage_options, remote_backend)
+            if _remote_path is not None
+            else 'fsspec'
+        )
         self.is_open = False
-        self.sample_ids = []
+        # Anchored at construction: the rows are parsed on first access to the
+        # `samples` property, so a relative path left unresolved would follow the
+        # process's current directory to whatever file sits there by then.
+        self.sample_path = os.path.abspath(sample_path) if sample_path else None
+        # Sample IDs are materialized on first access (see the `samples`
+        # property). At biobank scale building them is hundreds of thousands of
+        # Python strings, which a read that never asks for sample IDs should not
+        # pay for. None means "not built yet"; an empty list is a real answer.
+        self.sample_ids = None
+        self.dosage_stats = None
 
         # Check files exist (skip for remote paths as they'll be handled by C++)
         if not is_remote_path(self.file_path):
@@ -107,11 +155,12 @@ cdef class BgenReader:
         decompressor_type = 'sequential' if num_threads == 1 else 'parallel'
         self.set_decompressor_type(decompressor_type, num_threads)
         
-        # Load samples
+        # Check the .sample file up front so a missing or truncated one is
+        # reported when the reader is opened, not on some later attribute access.
+        # Only the two mandated header lines are read here; the per-sample rows
+        # are parsed on demand.
         if sample_path:
-            self._load_samples_from_file(sample_path)
-        else:
-            self._load_samples_from_bgen()
+            self._check_sample_file(self.sample_path)
     
     cdef void _init_reader(self) except *:
         """Initialize C++ reader components."""
@@ -123,7 +172,7 @@ cdef class BgenReader:
             # Download the remote BGI index into the local cache directory, then
             # pass the local path to C++.
             from .remote import ensure_local_bgi
-            local_bgi_path = ensure_local_bgi(self.bgi_path, self.storage_options)
+            local_bgi_path = ensure_local_bgi(self.bgi_path, self.storage_options, self.remote_backend)
             cpp_bgi_path = local_bgi_path.encode('utf-8')
             # Update self.bgi_path to the local path for consistency
             self.bgi_path = local_bgi_path
@@ -132,7 +181,8 @@ cdef class BgenReader:
         
         try:
             # Create main reader
-            self.impl.reset(new BgenReaderImpl(cpp_file_path, cpp_bgi_path, self.storage_options))
+            self.impl.reset(new BgenReaderImpl(cpp_file_path, cpp_bgi_path, self.storage_options,
+                                               self.remote_backend.encode('utf-8')))
             
             # Store header info
             self.header_info = self.impl.get().header()
@@ -143,31 +193,76 @@ cdef class BgenReader:
         except Exception as e:
             raise RuntimeError(f"Failed to initialize BGEN reader: {e}")
     
+    def _check_sample_file(self, sample_path: str):
+        """Validate a .sample file's header without parsing its rows.
+
+        The .sample format mandates two header lines (column names, then column
+        types) before the per-sample rows. Reading just those two catches a
+        missing or truncated file at open, while leaving the per-sample rows
+        (which dominate the cost at biobank scale) to _load_samples_from_file.
+        Only the file's state at open is checked; a file removed or truncated
+        afterwards surfaces when the rows are read.
+        """
+        with open(sample_path, 'r') as f:
+            if not f.readline() or not f.readline():
+                raise ValueError(
+                    f"Malformed .sample file (expected at least 2 header lines): {sample_path}"
+                )
+
     def _load_samples_from_file(self, sample_path: str):
         """Load sample IDs from .sample file."""
+        # Reuse the last file parsed, if this is that same file unchanged.
+        # Parsing is ~500K Python strings at biobank scale and dominates a
+        # load_bgen call that reads only a handful of variants, so a loop of
+        # loads over one cohort would otherwise repeat it every time.
+        cache_key = _sample_file_key(sample_path)
+        if cache_key is not None:
+            cached = _SAMPLE_ID_CACHE.get(cache_key)
+            if cached is not None:
+                # A fresh list each time: the caller owns what it is handed and
+                # may mutate it, which must not reach the next reader.
+                self.sample_ids = list(cached)
+                return
+
         with open(sample_path, 'r') as f:
-            lines = f.readlines()
+            # Skip the two header lines validated at open.
+            if not f.readline() or not f.readline():
+                raise ValueError(
+                    f"Malformed .sample file (expected at least 2 header lines): {sample_path}"
+                )
+            # Column 2 (ID_2) is the primary ID. split(None, 2) stops after the
+            # field we want instead of splitting every remaining column, and it
+            # already ignores surrounding whitespace, so no separate strip() is
+            # needed. A row without at least two fields carries no ID.
+            self.sample_ids = [
+                parts[1]
+                for parts in (line.split(None, 2) for line in f)
+                if len(parts) >= 2
+            ]
 
-        # The .sample format mandates two header lines (column names, then column
-        # types) before the per-sample rows. Fail loudly on a truncated file
-        # rather than letting a bare StopIteration surface.
-        if len(lines) < 2:
-            raise ValueError(
-                f"Malformed .sample file (expected at least 2 header lines): {sample_path}"
-            )
+        if cache_key is not None:
+            # One file only: the pattern this serves is repeated loads over a
+            # single cohort, and the IDs are tens of megabytes to hold.
+            _SAMPLE_ID_CACHE.clear()
+            _SAMPLE_ID_CACHE[cache_key] = tuple(self.sample_ids)
 
-        # Read sample IDs from the rows after the two header lines.
-        self.sample_ids = []
-        for line in lines[2:]:
-            parts = line.strip().split()
-            if len(parts) >= 2:
-                # Use second column (ID_2) as primary ID
-                self.sample_ids.append(parts[1])
-    
+    cdef void _load_samples(self) except *:
+        """Materialize the sample IDs from whichever source was configured."""
+        if self.sample_path:
+            self._load_samples_from_file(self.sample_path)
+        else:
+            self._load_samples_from_bgen()
+
     cdef void _load_samples_from_bgen(self) except *:
         """Load sample IDs from BGEN file."""
-        cdef vector[string] cpp_samples = self.impl.get().sample_ids()
-        self.sample_ids = [s.decode('utf-8') for s in cpp_samples]
+        # Bound by reference: copying the C++ vector would duplicate every string
+        # before any of them reach Python.
+        cdef const vector[string]* cpp_samples = &self.impl.get().sample_ids()
+        cdef size_t i
+        cdef list out = []
+        for i in range(cpp_samples.size()):
+            out.append(cpp_samples.at(i).decode('utf-8'))
+        self.sample_ids = out
     
     def set_decompressor_type(self, decompressor_type: str, num_threads: int = 0):
         """
@@ -356,6 +451,11 @@ cdef class BgenReader:
             chrom, pos, rsid, ref, alt (access as ``info["chrom"]``) and
             ``dosage`` is a 1-D array of per-sample dosages (NaN for missing),
             length n_samples (after any sample filtering).
+
+            ``dosage`` is a view into the block it was decoded from, not a copy.
+            Its values never change (a block is only ever written once), but
+            holding onto one keeps that whole block alive, so call ``.copy()`` on
+            the ones you keep if you are retaining a subset of a long stream.
         """
         if block_size is not None and block_size < 1:
             raise ValueError("block_size must be a positive integer")
@@ -506,6 +606,9 @@ cdef class BgenReader:
         progress_callback
     ):
         """Load variant dosages from metadata."""
+        # Cleared up front so a decode path that gathers no stats reports None
+        # rather than an answer left over from a previous load.
+        self.dosage_stats = None
         cdef int n_variants = variant_metadata.size()
         if n_variants == 0:
             n_samples = len(sample_indices) if sample_indices is not None else self.header_info.n_samples
@@ -564,6 +667,13 @@ cdef class BgenReader:
         cdef size_t num_threads, out_stride, chunk_bytes
         cdef int chunk_start, chunk_end, chunk_n_variants, n_indices
         cdef const int* si_ptr = NULL
+        # Range / missing-call summary, folded across chunks. The block decode
+        # gathers it while each column is still in cache, which is what lets
+        # load_bgen validate the result without scanning the whole matrix again.
+        cdef const DosageStats* chunk_stats
+        cdef double stats_min = float('inf')
+        cdef double stats_max = float('-inf')
+        cdef bint stats_has_nan = False
         # Cap on compressed bytes held in memory per parallel chunk. The C++ path
         # reads a whole chunk's compressed bytes up front (on this thread) before
         # the parallel inflate+decode, so chunking keeps peak memory bounded
@@ -609,15 +719,25 @@ cdef class BgenReader:
                         self.impl.get().read_decode_block_filtered_parallel(
                             &variant_metadata[chunk_start], <size_t>chunk_n_variants, si_ptr, n_indices,
                             &f64_out[0, chunk_start], out_stride, num_threads)
+                chunk_stats = &self.impl.get().last_block_stats()
+                if chunk_stats.min_value < stats_min:
+                    stats_min = chunk_stats.min_value
+                if chunk_stats.max_value > stats_max:
+                    stats_max = chunk_stats.max_value
+                if chunk_stats.has_nan:
+                    stats_has_nan = True
                 if progress_callback is not None:
                     progress_callback(chunk_end)
                 chunk_start = chunk_end
+            # `bool` here is the C++ type from the .pxd, so build the Python
+            # bool explicitly.
+            self.dosage_stats = (stats_min, stats_max, True if stats_has_nan else False)
             variant_info = self._build_variant_info_frame(variant_metadata)
             return dosages, variant_info
 
         cdef int i, batch_start, batch_end
-        # Process variants in batches for progress reporting cadence. (The previous
-        # dynamic batch size only gated the progress callback; decoding is per-variant.)
+        # Batching here sets the progress-callback cadence only; decoding is
+        # per-variant either way.
         cdef int batch_size
         if n_variants < 1000:
             batch_size = 100
@@ -744,39 +864,48 @@ cdef class BgenReader:
     def _build_variant_info_frame(self, vector[VariantMetadata]& metadata) -> pd.DataFrame:
         """Build the variant-info DataFrame from metadata.
 
-        Builds one Python list per column and constructs the DataFrame from a
-        dict of columns, instead of a per-variant dict fed to
-        ``pd.DataFrame(list_of_dicts)`` (which pandas reassembles into columns
-        with per-row type inference). Same columns, order, and dtypes; cheaper
-        for many variants.
+        Columns are filled as already-typed arrays rather than Python lists:
+        handed lists, pandas re-infers a dtype per column, which costs more than
+        writing the values did. Each entry is read through a pointer, since
+        copying a VariantMetadata per variant would copy three std::strings and
+        the allele vector with it. Same columns, order, and dtypes as before.
         """
         cdef Py_ssize_t n = metadata.size()
         if n == 0:
             return pd.DataFrame()
 
-        chroms = [None] * n
-        positions = [0] * n
-        rsids = [None] * n
-        refs = [None] * n
-        alts = [None] * n
+        chroms = np.empty(n, dtype=object)
+        rsids = np.empty(n, dtype=object)
+        refs = np.empty(n, dtype=object)
+        alts = np.empty(n, dtype=object)
+        positions = np.empty(n, dtype=np.int64)
 
-        cdef VariantMetadata var
+        cdef object[:] chrom_view = chroms
+        cdef object[:] rsid_view = rsids
+        cdef object[:] ref_view = refs
+        cdef object[:] alt_view = alts
+        cdef np.int64_t[:] pos_view = positions
+
+        cdef const VariantMetadata* var
         cdef Py_ssize_t i
         for i in range(n):
-            var = metadata[i]
-            chroms[i] = var.chromosome.decode('utf-8')
-            positions[i] = var.position
-            rsids[i] = var.rsid.decode('utf-8')
-            refs[i] = var.alleles[0].decode('utf-8') if var.alleles.size() > 0 else ''
-            alts[i] = var.alleles[1].decode('utf-8') if var.alleles.size() > 1 else ''
+            var = &metadata[i]
+            chrom_view[i] = var.chromosome.decode('utf-8')
+            pos_view[i] = var.position
+            rsid_view[i] = var.rsid.decode('utf-8')
+            ref_view[i] = var.alleles[0].decode('utf-8') if var.alleles.size() > 0 else ''
+            alt_view[i] = var.alleles[1].decode('utf-8') if var.alleles.size() > 1 else ''
 
-        return pd.DataFrame({
-            'chrom': chroms,
-            'pos': positions,
-            'rsid': rsids,
-            'ref': refs,
-            'alt': alts,
-        })
+        return pd.DataFrame(
+            {
+                'chrom': chroms,
+                'pos': positions,
+                'rsid': rsids,
+                'ref': refs,
+                'alt': alts,
+            },
+            copy=False,
+        )
     
     cdef void _ensure_open(self) except *:
         """Ensure reader is open."""
@@ -816,8 +945,24 @@ cdef class BgenReader:
         return self.header_info.n_variants
     
     @property
+    def last_dosage_stats(self):
+        """Summary of the values the most recent decode wrote, or None.
+
+        Returns ``(min, max, has_nan)``, where min and max ignore missing calls
+        (so an all-missing result reports ``inf`` and ``-inf``) and has_nan says
+        whether any missing call was written. The block decode collects this as
+        it goes, at no meaningful cost, which saves callers a second pass over
+        the result. It is None when the decode ran through the per-variant
+        serial loop, which does not collect it; callers that need the answer
+        must then compute it from the returned array.
+        """
+        return self.dosage_stats
+
+    @property
     def samples(self) -> List[str]:
-        """List of sample IDs."""
+        """List of sample IDs (materialized on first access, then cached)."""
+        if self.sample_ids is None:
+            self._load_samples()
         return self.sample_ids
     
     @property
@@ -851,7 +996,23 @@ cdef class BgenReader:
         Tuple[List[int], List[str]]
             (indices, found_sample_ids)
         """
-        sample_map = {sid: i for i, sid in enumerate(self.sample_ids)}
+        samples = self.samples
+        if len(sample_ids) * 3 <= len(samples):
+            # Small cohort: index only the samples that were asked for. Building
+            # a position for every sample in the file costs far more than the
+            # lookups it serves when a study wants a few thousand of half a
+            # million. Measured on 500k samples, this wins up to about a third of
+            # them and loses beyond that, hence the ratio above; both branches
+            # keep the last position of a repeated ID, as a single dict
+            # comprehension would.
+            wanted = set(sample_ids)
+            sample_map = {}
+            for i, sid in enumerate(samples):
+                if sid in wanted:
+                    sample_map[sid] = i
+        else:
+            sample_map = {sid: i for i, sid in enumerate(samples)}
+
         indices = []
         found_ids = []
         

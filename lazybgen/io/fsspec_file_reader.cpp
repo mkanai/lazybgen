@@ -13,8 +13,18 @@ namespace bgen {
 
 namespace {
 struct Backend { const char* module; const char* class_name; };
-// Map URL scheme -> (fsspec module, FileSystem class).
-bool backend_for(const std::string& f, Backend* out) {
+// Map (URL scheme, transport) -> (module, FileSystem class). The obstore
+// transport serves every scheme from one adapter class, which keys its own
+// store off the URL; the fsspec transport has one class per scheme. Adding a
+// scheme is one more line here plus one entry in lazybgen/remote.py.
+bool backend_for(const std::string& f, const std::string& transport, Backend* out) {
+    if (transport == "obstore") {
+        if (f.rfind("gs://", 0) == 0 || f.rfind("s3://", 0) == 0) {
+            *out = {"lazybgen.obstore_backend", "ObstoreFileSystem"};
+            return true;
+        }
+        return false;
+    }
     if (f.rfind("gs://", 0) == 0) { *out = {"gcsfs", "GCSFileSystem"}; return true; }
     if (f.rfind("s3://", 0) == 0) { *out = {"s3fs", "S3FileSystem"}; return true; }
     return false;
@@ -36,12 +46,15 @@ class GilGuard {
 }  // namespace
 
 FsspecFileReader::FsspecFileReader(const std::string& filename, PyObject* storage_options,
-                                   size_t buffer_size, size_t block_size)
+                                   const std::string& transport, size_t buffer_size,
+                                   size_t block_size)
     : fs_module_(nullptr),
       fs_(nullptr),
       file_obj_(nullptr),
       storage_options_(storage_options),
+      has_cat_ranges_(false),
       filename_(filename),
+      transport_(transport.empty() ? std::string("fsspec") : transport),
       file_size_(0),
       current_pos_(0),
       is_open_(false),
@@ -50,7 +63,7 @@ FsspecFileReader::FsspecFileReader(const std::string& filename, PyObject* storag
       buffer_start_(0),
       buffer_valid_(0) {
     Backend backend;
-    if (!backend_for(filename, &backend)) {
+    if (!backend_for(filename, transport_, &backend)) {
         throw std::runtime_error("FsspecFileReader: unsupported URL scheme: " + filename);
     }
     buffer_.resize(buffer_size_);
@@ -85,12 +98,18 @@ void FsspecFileReader::initialize_python() {
     GilGuard gil;
 
     Backend backend{};
-    backend_for(filename_, &backend);  // validated in ctor
+    backend_for(filename_, transport_, &backend);  // validated in ctor
 
     fs_module_ = PyImport_ImportModule(backend.module);
     if (!fs_module_) {
-        throw std::runtime_error(std::string("Failed to import ") + backend.module +
-                                 " module. Please install: pip install " + backend.module);
+        // The obstore adapter ships with lazybgen, so only the fsspec backends are
+        // something the user can install; naming the module to pip-install would be
+        // nonsense for the other one.
+        std::string detail = transport_ == "obstore"
+                                 ? std::string(". This is an internal module and should "
+                                               "always be importable")
+                                 : std::string(". Please install: pip install ") + backend.module;
+        throw std::runtime_error(std::string("Failed to import ") + backend.module + detail);
     }
 
     PyObject* fs_class = PyObject_GetAttrString(fs_module_, backend.class_name);
@@ -168,6 +187,10 @@ void FsspecFileReader::open_file() {
         raise_python_error("parse file size");
     }
     Py_DECREF(info_result);
+
+    // Batched range reads go through fs.cat_ranges, which older fsspec releases
+    // do not have. Probe once here so read_many can fall back silently.
+    has_cat_ranges_ = PyObject_HasAttrString(fs_, "cat_ranges") == 1;
 
     // Open the file handle (uses block_size_ for the fsspec readahead block).
     open_file_handle();
@@ -268,6 +291,251 @@ size_t FsspecFileReader::read_at(uint64_t offset, uint8_t* buffer, size_t size) 
 
     // For read_at, we bypass the buffer and read directly
     return read_internal(offset, buffer, size);
+}
+
+namespace {
+// One cat_ranges call puts every range in it in flight at once, so a call's
+// range count is the concurrency and its byte total is what the returned Python
+// objects hold at that moment. 128 matches fsspec's own default gather batch.
+constexpr size_t kMaxRangesPerCall = 128;
+constexpr size_t kMaxBytesPerCall = 64u * 1024u * 1024u;
+
+// Ranges closer together than this are fetched as one request. A separate
+// request costs a round trip (milliseconds); pulling a few unwanted kilobytes
+// alongside the wanted ones costs far less. Variants selected from a contiguous
+// region sit back to back, so they collapse into larger requests, while a
+// scattered selection is spread across megabytes and never merges.
+constexpr uint64_t kMaxMergeGap = 64u * 1024u;
+
+// Upper bound on a single merged request, so a long contiguous run becomes
+// several requests that go out together instead of one that goes out alone.
+// This has to stay well under kMaxBytesPerCall: a merged run is bandwidth-bound
+// rather than latency-bound, and if one merged request could fill a whole call
+// then a contiguous read would issue them one at a time and reach a fraction of
+// the available throughput.
+constexpr uint64_t kMaxMergedBytes = 4u * 1024u * 1024u;
+
+// At least this many merged requests must fit in one call, or the merging above
+// would serialize exactly the reads it is meant to speed up.
+constexpr size_t kMinMergedPerCall = 8;
+static_assert(kMaxMergedBytes * kMinMergedPerCall <= kMaxBytesPerCall,
+              "kMaxMergedBytes is too close to kMaxBytesPerCall: merged requests "
+              "would be issued one per cat_ranges call, with no concurrency");
+static_assert(kMinMergedPerCall <= kMaxRangesPerCall,
+              "kMaxRangesPerCall cannot admit kMinMergedPerCall merged requests");
+
+// One request covering [offset, offset + size), serving ranges order[first,last).
+struct FetchGroup {
+    uint64_t offset;
+    size_t size;
+    size_t first;
+    size_t last;
+};
+}  // namespace
+
+void FsspecFileReader::read_many(const uint64_t* offsets, const size_t* sizes,
+                                 uint8_t* const* buffers, size_t* out_read, size_t count) {
+    if (!is_open_) {
+        throw std::runtime_error("FsspecFileReader: file is not open");
+    }
+    if (count == 0) {
+        return;
+    }
+    // A single range has nothing to overlap or overlap with, and without
+    // cat_ranges there is no batched path to take. Both keep the buffered
+    // read_at behavior they had before.
+    if (count == 1 || !has_cat_ranges_) {
+        for (size_t i = 0; i < count; ++i) {
+            out_read[i] = read_internal(offsets[i], buffers[i], sizes[i]);
+        }
+        return;
+    }
+
+    // Group in file order so neighbours can be merged, whatever order the
+    // caller listed them in.
+    std::vector<size_t> order(count);
+    for (size_t i = 0; i < count; ++i) {
+        order[i] = i;
+    }
+    std::sort(order.begin(), order.end(),
+              [offsets](size_t a, size_t b) { return offsets[a] < offsets[b]; });
+
+    std::vector<FetchGroup> groups;
+    for (size_t k = 0; k < count; ++k) {
+        const size_t i = order[k];
+        const uint64_t begin = offsets[i];
+        const uint64_t end = begin + sizes[i];
+        if (!groups.empty()) {
+            FetchGroup& g = groups.back();
+            const uint64_t group_end = g.offset + g.size;
+            // Overlapping or nested ranges have no gap at all, so max() keeps a
+            // shorter follower from shrinking the group.
+            const uint64_t gap = begin > group_end ? begin - group_end : 0;
+            const uint64_t merged = std::max(end, group_end) - g.offset;
+            if (gap <= kMaxMergeGap && merged <= kMaxMergedBytes) {
+                g.size = static_cast<size_t>(merged);
+                g.last = k + 1;
+                continue;
+            }
+        }
+        groups.push_back(FetchGroup{begin, sizes[i], k, k + 1});
+    }
+
+    // Issue the groups in batches, bounded by request count and by the bytes a
+    // batch materializes at once.
+    std::vector<uint64_t> batch_offsets;
+    std::vector<size_t> batch_sizes;
+    std::vector<std::vector<uint8_t>> fetched;
+    size_t g0 = 0;
+    while (g0 < groups.size()) {
+        size_t g1 = g0;
+        size_t bytes = 0;
+        while (g1 < groups.size() && (g1 - g0) < kMaxRangesPerCall &&
+               (g1 == g0 || bytes + groups[g1].size <= kMaxBytesPerCall)) {
+            bytes += groups[g1].size;
+            ++g1;
+        }
+
+        batch_offsets.clear();
+        batch_sizes.clear();
+        for (size_t g = g0; g < g1; ++g) {
+            batch_offsets.push_back(groups[g].offset);
+            batch_sizes.push_back(groups[g].size);
+        }
+        fetched.assign(g1 - g0, std::vector<uint8_t>());
+        std::vector<uint8_t*> dests(g1 - g0);
+        std::vector<size_t> got(g1 - g0, 0);
+        for (size_t g = g0; g < g1; ++g) {
+            fetched[g - g0].resize(groups[g].size);
+            dests[g - g0] = fetched[g - g0].data();
+        }
+        fetch_ranges(batch_offsets.data(), batch_sizes.data(), dests.data(), got.data(), g1 - g0);
+
+        // Hand each range its slice of the group it landed in. A group short of
+        // its requested length (a range past the end of the file) yields
+        // correspondingly short reads, which the caller checks.
+        for (size_t g = g0; g < g1; ++g) {
+            const FetchGroup& group = groups[g];
+            const std::vector<uint8_t>& data = fetched[g - g0];
+            const size_t available = got[g - g0];
+            for (size_t k = group.first; k < group.last; ++k) {
+                const size_t i = order[k];
+                const size_t start = static_cast<size_t>(offsets[i] - group.offset);
+                const size_t take =
+                    start >= available ? 0 : std::min(sizes[i], available - start);
+                if (take > 0) {
+                    std::memcpy(buffers[i], data.data() + start, take);
+                }
+                out_read[i] = take;
+            }
+        }
+        g0 = g1;
+    }
+}
+
+void FsspecFileReader::fetch_ranges(const uint64_t* offsets, const size_t* sizes,
+                                    uint8_t* const* buffers, size_t* out_read, size_t count) {
+    RetryWrapper<size_t>::execute_with_retry(
+        [this, offsets, sizes, buffers, out_read, count]() -> size_t {
+            GilGuard gil;
+
+            // cat_ranges takes parallel lists: one path per range, plus start and
+            // end offsets. Every range here is on the same file.
+            PyObject* paths = PyList_New(static_cast<Py_ssize_t>(count));
+            PyObject* starts = PyList_New(static_cast<Py_ssize_t>(count));
+            PyObject* ends = PyList_New(static_cast<Py_ssize_t>(count));
+            if (!paths || !starts || !ends) {
+                Py_XDECREF(paths);
+                Py_XDECREF(starts);
+                Py_XDECREF(ends);
+                raise_python_error("allocate cat_ranges arguments");
+            }
+            for (size_t i = 0; i < count; ++i) {
+                PyObject* path = PyUnicode_FromString(filename_.c_str());
+                PyObject* begin = PyLong_FromUnsignedLongLong(offsets[i]);
+                PyObject* stop = PyLong_FromUnsignedLongLong(
+                    static_cast<unsigned long long>(offsets[i]) + sizes[i]);
+                if (!path || !begin || !stop) {
+                    Py_XDECREF(path);
+                    Py_XDECREF(begin);
+                    Py_XDECREF(stop);
+                    Py_DECREF(paths);
+                    Py_DECREF(starts);
+                    Py_DECREF(ends);
+                    raise_python_error("encode cat_ranges arguments");
+                }
+                // PyList_SET_ITEM steals the reference.
+                PyList_SET_ITEM(paths, static_cast<Py_ssize_t>(i), path);
+                PyList_SET_ITEM(starts, static_cast<Py_ssize_t>(i), begin);
+                PyList_SET_ITEM(ends, static_cast<Py_ssize_t>(i), stop);
+            }
+
+            PyObject* result =
+                PyObject_CallMethod(fs_, "cat_ranges", "OOO", paths, starts, ends);
+            Py_DECREF(paths);
+            Py_DECREF(starts);
+            Py_DECREF(ends);
+            if (!result) {
+                raise_python_error("cat_ranges");
+            }
+
+            PyObject* seq = PySequence_Fast(result, "cat_ranges did not return a sequence");
+            if (!seq) {
+                Py_DECREF(result);
+                raise_python_error("read cat_ranges result");
+            }
+            if (static_cast<size_t>(PySequence_Fast_GET_SIZE(seq)) != count) {
+                const Py_ssize_t got = PySequence_Fast_GET_SIZE(seq);
+                Py_DECREF(seq);
+                Py_DECREF(result);
+                throw std::runtime_error("FsspecFileReader: cat_ranges returned " +
+                                         std::to_string(got) + " results for " +
+                                         std::to_string(count) + " ranges");
+            }
+
+            for (size_t i = 0; i < count; ++i) {
+                // Borrowed reference into the sequence.
+                PyObject* item = PySequence_Fast_GET_ITEM(seq, static_cast<Py_ssize_t>(i));
+                // Any object exposing a contiguous buffer is acceptable: fsspec
+                // returns bytes, the obstore adapter returns a view of the Rust
+                // allocation, and taking the buffer rather than the bytes keeps
+                // the latter copy-free. An async filesystem (gcsfs, s3fs) hands a
+                // failed range back as the exception object in the result list
+                // rather than raising, and an exception has no buffer, so this
+                // check catches that too.
+                Py_buffer view;
+                if (PyObject_GetBuffer(item, &view, PyBUF_SIMPLE) < 0) {
+                    PyErr_Clear();
+                    std::string detail = "result does not expose a buffer";
+                    PyObject* text = PyObject_Repr(item);
+                    if (text) {
+                        const char* utf8 = PyUnicode_AsUTF8(text);
+                        if (utf8) {
+                            detail = utf8;
+                        }
+                        Py_DECREF(text);
+                    }
+                    PyErr_Clear();
+                    Py_DECREF(seq);
+                    Py_DECREF(result);
+                    throw std::runtime_error("FsspecFileReader: cat_ranges failed for range at " +
+                                             std::to_string(offsets[i]) + ": " + detail);
+                }
+                // Clamp exactly as read_internal does: the destination holds only
+                // sizes[i] bytes whatever the filesystem hands back.
+                const size_t copied = std::min(static_cast<size_t>(view.len), sizes[i]);
+                if (copied > 0) {
+                    std::memcpy(buffers[i], view.buf, copied);
+                }
+                PyBuffer_Release(&view);
+                out_read[i] = copied;
+            }
+
+            Py_DECREF(seq);
+            Py_DECREF(result);
+            return count;
+        },
+        "cat_ranges");
 }
 
 void FsspecFileReader::seek(uint64_t offset) {

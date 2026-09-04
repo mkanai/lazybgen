@@ -53,8 +53,15 @@ SIZES = [
     ("500k x 10k", 500000, 10000),
 ]
 
-REGION_VARIANTS = 500  # contiguous block for the `region` workload
-SCATTERED_VARIANTS = 200  # spread-out lookups for the `scattered` workload
+# Variants read by the slice workloads. Sized so the measured read stays well
+# clear of timer and scheduler noise now that the reader is fast: at 500 and 200
+# a 5k-sample region read was ~6 ms, where a few hundred microseconds of jitter
+# is a visible "regression". These land the same read at tens of ms small and
+# ~1 s at 500k samples. They are the ladder's constant, so a run that changes
+# them is not comparable with one that does not; --region-variants and
+# --scattered-variants exist for quick local runs, not for published numbers.
+REGION_VARIANTS = 2000  # contiguous block for the `region` workload
+SCATTERED_VARIANTS = 1000  # spread-out lookups for the `scattered` workload
 
 # Skip the full_decode workload when its (variants x samples) f64 output matrix
 # would exceed this; full materialization is not a realistic workload at that
@@ -90,8 +97,37 @@ def single_position(variants):
     return ((variants // 2) + 1) * POS_STRIDE
 
 
+def _vm_hwm_bytes():
+    """This process's peak RSS as the kernel recorded it, or None if unavailable."""
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+def _reset_vm_hwm():
+    """Reset the kernel's peak-RSS mark so the next reading covers one run only."""
+    try:
+        with open("/proc/self/clear_refs", "w") as fh:
+            fh.write("5")
+        return True
+    except OSError:
+        return False
+
+
 class PeakRSS:
-    """Sample this process's RSS in a daemon thread; report the peak (MiB)."""
+    """Peak RSS (MiB) over the enclosed block.
+
+    Prefers the kernel's own high-water mark, reset on entry, because sampling
+    from a Python thread cannot see a peak that happens while the measured code
+    holds the GIL: a decode that never yields keeps the sampler off the CPU for
+    its whole duration, and the reading comes back near the pre-run baseline. On
+    a platform without /proc, this falls back to sampling and is subject to that.
+    """
 
     def __init__(self, proc, interval=0.005):
         self.proc = proc
@@ -99,9 +135,13 @@ class PeakRSS:
         self.peak = 0
         self._stop = False
         self._t = None
+        self._kernel = False
 
     def __enter__(self):
         self.peak = self.proc.memory_info().rss
+        if _reset_vm_hwm() and _vm_hwm_bytes() is not None:
+            self._kernel = True
+            return self
         self._stop = False
         self._t = threading.Thread(target=self._run, daemon=True)
         self._t.start()
@@ -116,6 +156,11 @@ class PeakRSS:
             time.sleep(self.interval)
 
     def __exit__(self, *exc):
+        if self._kernel:
+            hwm = _vm_hwm_bytes()
+            if hwm is not None:
+                self.peak = max(self.peak, hwm)
+            return False
         self._stop = True
         if self._t is not None:
             self._t.join(timeout=1.0)
@@ -211,34 +256,203 @@ def bgen_workloads(bf, samples, variants):
     return {"full_decode": full, "region": region_w, "scattered": scattered, "single": single_w}
 
 
-def measure(fn, num_runs, warmup, proc):
-    for _ in range(warmup):
+def minor_faults():
+    """This process's cumulative minor page-fault count, or None if unavailable.
+
+    Differencing it across a run counts the pages the run first-touched, which is
+    what separates "the allocator handed back a warm block" from "this run faulted
+    in a fresh mapping". A large output matrix is first-touched by whichever
+    thread writes each page, so the delta tracks a cost that wall time alone
+    attributes to decoding.
+    """
+    try:
+        import resource
+
+        return resource.getrusage(resource.RUSAGE_SELF).ru_minflt
+    except Exception:
+        return None
+
+
+def _timed_call(fn, proc):
+    """Run fn once, returning (wall seconds, peak RSS MiB, minor-fault delta)."""
+    faults_before = minor_faults()
+    with PeakRSS(proc) as rss:
+        t0 = time.perf_counter()
+        fn()
+        dt = time.perf_counter() - t0
+    faults_after = minor_faults()
+    faults = None if faults_before is None or faults_after is None else faults_after - faults_before
+    return dt, rss.peak_mb, faults
+
+
+def _summarize(times, mems, faults, first):
+    median = statistics.median(times)
+    out = {
+        "ok": True,
+        "median_time": median,
+        "min_time": min(times),
+        "max_time": max(times),
+        # Spread of the measured runs as a fraction of the median. A speedup
+        # smaller than this is not a result, and recording it means that can be
+        # checked afterwards instead of assumed.
+        "spread": (max(times) - min(times)) / median if median > 0 else None,
+        "peak_memory_mb": statistics.median(mems),
+    }
+    known = [f for f in faults if f is not None]
+    if known:
+        out["minor_faults"] = statistics.median(known)
+    if first is not None:
+        out["first_call"] = first
+    return out
+
+
+def measure(fn, num_runs, warmup, proc, before=None):
+    """Time fn: `warmup` untimed-for-the-median passes, then `num_runs` measured.
+
+    The reported time is the median of the measured runs, which is a warm-loop
+    number: the page cache is hot and the allocator is likely handing back the
+    block the previous run freed. The first warmup pass is timed separately and
+    reported as ``first_call`` so that regime is visible rather than assumed.
+
+    ``before`` runs before each pass and outside the timer, for per-run setup
+    such as clearing a cache the workload would otherwise reuse.
+    """
+    first = None
+    for i in range(warmup):
         try:
-            fn()
+            if before is not None:
+                before()
+            dt, peak, faults = _timed_call(fn, proc)
+            if i == 0:
+                first = {"time": dt, "peak_memory_mb": peak, "minor_faults": faults}
         except Exception as e:
             return {"ok": False, "error": repr(e)}
         gc.collect()
-    times, mems = [], []
+    times, mems, faults_seen = [], [], []
     for _ in range(num_runs):
         try:
-            with PeakRSS(proc) as rss:
-                t0 = time.perf_counter()
-                fn()
-                dt = time.perf_counter() - t0
+            if before is not None:
+                before()
+            dt, peak, faults = _timed_call(fn, proc)
             times.append(dt)
-            mems.append(rss.peak_mb)
+            mems.append(peak)
+            faults_seen.append(faults)
             gc.collect()
         except Exception as e:
             return {"ok": False, "error": repr(e)}
-    return {
-        "ok": True,
-        "median_time": statistics.median(times),
-        "min_time": min(times),
-        "peak_memory_mb": statistics.median(mems),
+    return _summarize(times, mems, faults_seen, first)
+
+
+def measure_interleaved(fns, num_runs, warmup, proc, before=None):
+    """Time several callables round-robin, one pass each per repetition.
+
+    ``measure`` finishes every run of one callable before starting the next, so a
+    machine that drifts over the course of a sweep charges the drift to whichever
+    callable ran later. Alternating them spreads any drift across all of them,
+    which matters when two libraries are being compared on the same workload.
+
+    Takes ``{name: callable}`` (a None callable is skipped) and returns
+    ``{name: result}`` in the same shape ``measure`` returns.
+    """
+    names = [n for n, f in fns.items() if f is not None]
+    state = {n: {"times": [], "mems": [], "faults": [], "first": None, "error": None} for n in names}
+    for rep in range(warmup + num_runs):
+        measured = rep >= warmup
+        for n in names:
+            st = state[n]
+            if st["error"] is not None:
+                continue
+            try:
+                if before is not None:
+                    before()
+                dt, peak, faults = _timed_call(fns[n], proc)
+            except Exception as e:
+                st["error"] = repr(e)
+                continue
+            if rep == 0:
+                st["first"] = {"time": dt, "peak_memory_mb": peak, "minor_faults": faults}
+            if measured:
+                st["times"].append(dt)
+                st["mems"].append(peak)
+                st["faults"].append(faults)
+            gc.collect()
+    results = {}
+    for n in names:
+        st = state[n]
+        if st["error"] is not None or not st["times"]:
+            results[n] = {"ok": False, "error": st["error"] or "no measured runs"}
+        else:
+            results[n] = _summarize(st["times"], st["mems"], st["faults"], st["first"])
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Allocator regime
+# ---------------------------------------------------------------------------
+# glibc mallopt parameter numbers (malloc.h). M_MMAP_THRESHOLD decides when a
+# large allocation becomes its own mmap instead of coming out of the heap.
+M_TRIM_THRESHOLD = -1
+M_MMAP_THRESHOLD = -3
+
+
+def set_malloc_regime(regime):
+    """Pin how large output matrices are allocated. Returns a description.
+
+    glibc's mmap threshold is dynamic: it starts at 128 KB and grows, up to
+    32 MB, as freed mmap'd blocks are seen. So in a warm loop an output under
+    32 MB is usually recycled from the heap and never pays first-touch, while a
+    larger one gets a fresh mapping and faults in every page. Which side of that
+    line a workload lands on depends on the process's allocation history, so the
+    same call can be timed in two different regimes depending on what ran before
+    it.
+
+    ``default`` leaves glibc alone (what an application sees). ``mmap-always``
+    sets the threshold and the trim threshold to 0, so every large output is a
+    fresh mapping and every run pays first-touch: the one-shot cost, measured
+    repeatably. Returns a note describing what was applied.
+
+    ``mmap-always`` is not neutral in a head-to-head. It charges every allocation
+    to the allocator, so a reader that allocates once per matrix and one that
+    allocates once per variant are penalized very differently. Use it to compare
+    lazybgen against itself across sizes or builds; use ``default`` for the
+    library-vs-library tables.
+    """
+    if regime == "default":
+        return "default (glibc dynamic mmap threshold; warm loops may recycle heap blocks)"
+    if regime != "mmap-always":
+        raise ValueError(f"unknown malloc regime: {regime}")
+    import ctypes
+
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        ok_mmap = libc.mallopt(M_MMAP_THRESHOLD, 0)
+        ok_trim = libc.mallopt(M_TRIM_THRESHOLD, 0)
+    except Exception as e:
+        return f"mmap-always requested but mallopt is unavailable ({e!r}); running under the default regime"
+    if not ok_mmap or not ok_trim:
+        return "mmap-always requested but mallopt refused it; running under the default regime"
+    return "mmap-always (every large output is a fresh mapping; each run pays first-touch)"
+
+
+def environment_snapshot():
+    """Machine facts that change what a benchmark number means."""
+    vm = psutil.virtual_memory()
+    snap = {
+        "cpu_count": psutil.cpu_count(),
+        "memory_total_gb": vm.total / (1024**3),
+        "memory_available_gb": vm.available / (1024**3),
+        "page_cache_gb": (getattr(vm, "cached", 0) or 0) / (1024**3),
     }
+    try:
+        import os
+
+        snap["load_avg_1m"] = os.getloadavg()[0]
+    except Exception:
+        pass
+    return snap
 
 
-def run_local(data_dir, num_runs, warmup, max_full_gb=MAX_FULL_GB):
+def run_local(data_dir, num_runs, warmup, max_full_gb=MAX_FULL_GB, interleave=False):
     proc = psutil.Process()
     results = []
     for label, samples, variants in SIZES:
@@ -256,8 +470,12 @@ def run_local(data_dir, num_runs, warmup, max_full_gb=MAX_FULL_GB):
             workloads = ("region", "scattered", "single")
             print(f"  skip full_decode: {full_matrix_gb(samples, variants):.0f} GB matrix > {max_full_gb:.0f} GB")
         for w in workloads:
-            lz_m = measure(lz[w], num_runs, warmup, proc)
-            bg_m = measure(bg[w], num_runs, warmup, proc)
+            if interleave:
+                paired = measure_interleaved({"lazybgen": lz[w], "bgen": bg[w]}, num_runs, warmup, proc)
+                lz_m, bg_m = paired["lazybgen"], paired["bgen"]
+            else:
+                lz_m = measure(lz[w], num_runs, warmup, proc)
+                bg_m = measure(bg[w], num_runs, warmup, proc)
             row["workloads"][w] = {"lazybgen": lz_m, "bgen": bg_m}
             lt = f"{lz_m['median_time']*1000:.1f}ms" if lz_m["ok"] else "FAIL"
             bt = f"{bg_m['median_time']*1000:.1f}ms" if bg_m["ok"] else "FAIL"
@@ -312,6 +530,9 @@ def run_remote(bucket, files, num_runs, warmup, max_full_gb=MAX_FULL_GB):
 
 
 def main():
+    # Rebound from the CLI below; declared here because the argparse defaults
+    # read the module-level values first.
+    global REGION_VARIANTS, SCATTERED_VARIANTS
     p = argparse.ArgumentParser(description="lazybgen vs bgen head-to-head benchmark")
     p.add_argument("--data-dir", default="benchmarks/test_data")
     p.add_argument("--output", default="benchmarks/compare_results.json")
@@ -323,6 +544,18 @@ def main():
     )
     p.add_argument("--skip-local", action="store_true")
     p.add_argument(
+        "--region-variants",
+        type=int,
+        default=REGION_VARIANTS,
+        help=f"variants in the contiguous `region` read (default {REGION_VARIANTS})",
+    )
+    p.add_argument(
+        "--scattered-variants",
+        type=int,
+        default=SCATTERED_VARIANTS,
+        help=f"variants in the spread-out `scattered` read (default {SCATTERED_VARIANTS})",
+    )
+    p.add_argument(
         "--max-full-gb",
         type=float,
         default=MAX_FULL_GB,
@@ -330,20 +563,45 @@ def main():
         f"(default {MAX_FULL_GB:.0f}). Raise it on a high-memory host to measure the "
         "large full materializations that would otherwise hit the RAM ceiling.",
     )
+    p.add_argument(
+        "--interleave",
+        action="store_true",
+        help="Alternate the two libraries run by run instead of finishing one before starting the "
+        "other, so machine drift over a long sweep is not charged to whichever ran later. Off by "
+        "default: the published tables were measured without it.",
+    )
+    p.add_argument(
+        "--malloc-regime",
+        choices=["default", "mmap-always"],
+        default="default",
+        help="Allocator regime for output matrices. 'default' leaves glibc alone, so a warm loop "
+        "may recycle a heap block and skip first-touch. 'mmap-always' makes every large output a "
+        "fresh mapping, so every run pays first-touch (the one-shot cost).",
+    )
     args = p.parse_args()
+
+    malloc_note = set_malloc_regime(args.malloc_regime)
+    print(f"allocator: {malloc_note}")
 
     out = {
         "timestamp": datetime.now().isoformat(),
         "system": {"cpu": psutil.cpu_count(), "memory_gb": psutil.virtual_memory().total / (1024**3)},
+        "environment": environment_snapshot(),
         "num_runs": args.num_runs,
         "max_full_gb": args.max_full_gb,
+        "interleaved": args.interleave,
+        "malloc_regime": malloc_note,
         "local": [],
         "remote": [],
     }
 
+    REGION_VARIANTS = args.region_variants
+    SCATTERED_VARIANTS = args.scattered_variants
+    out["workload_variants"] = {"region": REGION_VARIANTS, "scattered": SCATTERED_VARIANTS}
+
     if not args.skip_local:
         print("=== LOCAL: lazybgen vs bgen ===")
-        out["local"] = run_local(args.data_dir, args.num_runs, args.warmup, args.max_full_gb)
+        out["local"] = run_local(args.data_dir, args.num_runs, args.warmup, args.max_full_gb, args.interleave)
 
     if args.remote_bucket:
         print("\n=== REMOTE: lazybgen only ===")

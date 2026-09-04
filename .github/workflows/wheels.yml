@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: recursive  # vendored zlib-ng + zstd must be present
+          submodules: recursive  # vendored libdeflate + zstd must be present
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v4.2.0
@@ -45,7 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: recursive  # so the sdist vendors zlib-ng + zstd
+          submodules: recursive  # so the sdist vendors libdeflate + zstd
 
       - name: Set up Python
         uses: actions/setup-python@v7

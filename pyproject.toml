@@ -1,12 +1,20 @@
 [build-system]
 # Build against NumPy 2.x: the resulting extensions are ABI-compatible with
 # runtime NumPy >= 1.23 and forward-compatible with 2.x (one wheel covers both).
-requires = ["setuptools>=77", "wheel", "Cython>=0.29.0", "numpy>=2.0.0", "cmake>=3.12"]
+requires = [
+    "setuptools>=77",
+    "wheel",
+    "Cython>=0.29.0",
+    "numpy>=2.0.0",
+    # Only the Windows zstd build shells out to CMake; libdeflate and the Unix
+    # zstd build compile directly from source.
+    'cmake>=3.12; sys_platform == "win32"',
+]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "lazybgen"
-version = "0.1.0"
+version = "0.2.0"
 description = "High-performance BGEN reader with cloud (GCS/S3) partial-read support"
 readme = "README.md"
 authors = [
@@ -14,13 +22,12 @@ authors = [
 ]
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 keywords = ["bgen", "genetics", "genomics", "gwas", "bioinformatics", "dosage", "gcs", "s3"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -38,15 +45,32 @@ dependencies = [
     "gcsfs>=0.7.0",
     "fsspec>=2021.0.0",
     "tqdm>=4.50.0",
+    # 0.9.1 is a hard floor, not a preference: `get_ranges` gained the `coalesce`
+    # keyword there, and the reader passes it on every batched read, so on an
+    # earlier obstore every remote read would raise TypeError.
+    # Default remote transport: HTTP and TLS in Rust with the GIL released, so a
+    # batch of byte ranges genuinely overlaps instead of queueing behind fsspec's
+    # single event loop. gcsfs/fsspec stay required, because they serve any
+    # storage_options obstore cannot express and remain the fallback if obstore
+    # is deselected at install time.
+    # Upper bound because obstore is pre-1.0 and this reader depends on a specific
+    # keyword surface (get_ranges(coalesce=), client_options, request_payer). That
+    # surface has already moved once: coalesce only appeared in 0.9.1, and a
+    # release that moves it again would break every gs:// read with no fallback,
+    # since the transport is chosen before the first request is made.
+    "obstore>=0.9.1,<1",
 ]
 
 [project.optional-dependencies]
 s3 = ["s3fs>=2021.0.0"]
+# obstore is a default dependency. The extra is an alias, so `lazybgen[obstore]`
+# installs the same thing rather than failing.
+obstore = ["obstore>=0.9.1,<1"]
 dev = [
     "pytest>=6.0.0",
-    "black>=25.11.0",  # last black supporting py3.9 (still in the matrix); 26.x needs >=3.10
+    "black>=25.11.0",
     "Cython>=0.29.0",
-    "cmake>=3.12",
+    'cmake>=3.12; sys_platform == "win32"',  # only the Windows zstd build needs it
     "ruff>=0.6.0",
     "check-wheel-contents>=0.6.0",  # guards against wheel bloat / missing py.typed
     # "bgen>=1.8.0",  # optional: enables correctness comparison vs a reference reader
@@ -60,14 +84,14 @@ dev = [
 
 [tool.setuptools]
 # Keep the wheel lean: ship only .py + compiled .so. The C/Cython sources and
-# vendored zlib-ng/zstd trees are build-time-only (statically linked into the
+# vendored libdeflate/zstd trees are build-time-only (statically linked into the
 # extensions) and stay in the sdist, not the installed wheel.
 include-package-data = false
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["lazybgen*"]
-exclude = ["lazybgen.zlib-ng*", "lazybgen.zstd*"]
+exclude = ["lazybgen.libdeflate*", "lazybgen.zstd*"]
 
 [tool.setuptools.package-data]
 # PEP 561 marker so type-checkers pick up lazybgen's hints (must be listed
@@ -77,13 +101,13 @@ lazybgen = ["py.typed"]
 [tool.black]
 line-length = 120
 # Vendored libs and the Cython-generated _build_config are not ours to format.
-extend-exclude = '/(zlib-ng|zstd)/|_build_config\.py'
+extend-exclude = '/(libdeflate|zstd)/|_build_config\.py'
 
 [tool.ruff]
 line-length = 120
-target-version = "py39"
+target-version = "py310"
 # Vendored libs and the Cython-generated _build_config are not ours to lint.
-extend-exclude = ["lazybgen/zlib-ng", "lazybgen/zstd", "lazybgen/_build_config.py"]
+extend-exclude = ["lazybgen/libdeflate", "lazybgen/zstd", "lazybgen/_build_config.py"]
 
 [tool.ruff.lint]
 # pycodestyle errors, pyflakes, warnings, import sorting. Formatting stays with black.
@@ -98,8 +122,8 @@ markers = [
 ]
 
 [tool.cibuildwheel]
-# Use PEP 517 `build` so the [build-system].requires toolchain (cmake, Cython,
-# numpy) is provisioned under isolation. Vendored zlib-ng/zstd come from the
+# Use PEP 517 `build` so the [build-system].requires toolchain (Cython, numpy)
+# is provisioned under isolation. Vendored libdeflate/zstd come from the
 # recursive submodule checkout in the workflow.
 build-frontend = "build"
 # cibuildwheel builds CPython only by default (PyPy is opt-in via `enable`), so
@@ -110,14 +134,14 @@ build-frontend = "build"
 # can still build from the sdist.
 skip = ["cp314t-*", "*-musllinux_i686", "*_i686", "*-win32"]
 # Smoke test each built wheel: importing the compiled extensions proves the
-# wheel links its bundled zlib-ng/zstd/sqlite correctly in a clean environment.
+# wheel links its bundled libdeflate/zstd/sqlite correctly in a clean environment.
 test-command = "python -c \"import lazybgen; from lazybgen import load_bgen, BgenReader, load_variant_filter, reader; print('wheel import OK')\""
 
 [tool.cibuildwheel.linux]
-# manylinux/musllinux containers need sqlite headers; cmake comes from the
-# build-system requires (the `cmake` wheel) under build isolation.
+# manylinux/musllinux containers need sqlite headers; the vendored libraries
+# compile directly from source and need no extra build tooling.
 before-all = "yum install -y sqlite-devel || apk add --no-cache sqlite-dev || true"
 
 [tool.cibuildwheel.macos]
-# arm64 wheels require a 11.0+ deployment target (see setup.py zlib-ng cmake).
+# arm64 wheels require a 11.0+ deployment target.
 environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }

@@ -17,12 +17,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13', '3.14']
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
 
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: recursive  # vendored zlib-ng + zstd
+          submodules: recursive  # vendored libdeflate + zstd
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v7
@@ -32,7 +32,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential libsqlite3-dev
+          sudo apt-get install -y build-essential libsqlite3-dev
 
       - name: Install package (with build + dev deps)
         run: |
@@ -70,7 +70,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential libsqlite3-dev
+          sudo apt-get install -y build-essential libsqlite3-dev
 
       - name: Build sdist + wheel
         run: |
@@ -86,8 +86,8 @@ jobs:
       - name: Verify sdist vendors the compression submodules
         run: |
           tar tzf dist/*.tar.gz | grep -q 'lazybgen/zstd/lib/zstd.h' \
-            && tar tzf dist/*.tar.gz | grep -q 'lazybgen/zlib-ng/' \
-            && echo "✓ sdist contains vendored zlib-ng + zstd"
+            && tar tzf dist/*.tar.gz | grep -q 'lazybgen/libdeflate/' \
+            && echo "✓ sdist contains vendored libdeflate + zstd"
 
       - name: Install the built wheel in a clean venv and import
         run: |

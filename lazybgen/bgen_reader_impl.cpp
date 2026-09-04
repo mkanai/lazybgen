@@ -1,5 +1,9 @@
 #include "bgen_reader_impl.h"
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 #include "format/bgen_header.h"
 #include "format/genotype_parser.h"
 #include "format/variant_parser.h"
@@ -180,7 +184,7 @@ class MMapFileReader : public FileReader {
         // Let the kernel adapt its readahead to the actual access pattern
         // (MADV_NORMAL): it ramps up for sequential scans (full-file / large
         // contiguous region decodes) and stays modest for indexed lookups. The
-        // previous MADV_RANDOM disabled readahead entirely, which is fine for
+        // alternative, MADV_RANDOM, disables readahead entirely, which suits
         // scattered point reads but makes a cold full/region scan fault one page
         // at a time off disk (an order of magnitude slower than warm). Local
         // readahead over-fetch is nearly free (page cache, fast disk), unlike the
@@ -211,6 +215,16 @@ class MMapFileReader : public FileReader {
         size_t bytes_to_read = std::min(size, static_cast<size_t>(file_size_ - offset));
         memcpy(buffer, data_ + offset, bytes_to_read);
         return bytes_to_read;
+    }
+
+    // The whole file is already mapped, so any in-bounds range can be handed
+    // out in place. Out-of-bounds ranges return nullptr and the caller falls
+    // back to read_at, which clamps to EOF and reports the short read.
+    const uint8_t* view_at(uint64_t offset, size_t size) const override {
+        if (!data_ || offset > file_size_ || size > file_size_ - offset) {
+            return nullptr;
+        }
+        return data_ + offset;
     }
 
     void seek(uint64_t offset) override {
@@ -257,7 +271,7 @@ class BgenReaderImpl::Impl {
    public:
     // Constructor
     Impl(const std::string& filename, const std::string& bgi_filename,
-         PyObject* storage_options = nullptr)
+         PyObject* storage_options = nullptr, const std::string& remote_transport = "fsspec")
         : filename_(filename),
           bgi_filename_(bgi_filename),
           file_reader_(),
@@ -270,7 +284,7 @@ class BgenReaderImpl::Impl {
           decompressor_type_("sequential") {
         try {
             // Open the BGEN file
-            open_file(storage_options);
+            open_file(storage_options, remote_transport);
 
             // Read and parse header
             parse_header();
@@ -302,8 +316,18 @@ class BgenReaderImpl::Impl {
         return header_;
     }
 
-    // Get sample IDs
-    std::vector<std::string> sample_ids() {
+    // Get sample IDs. A file with no sample block carries placeholder IDs, which
+    // are built here on demand: generating them at open costs one string per
+    // sample (hundreds of thousands at biobank scale) for a list most reads
+    // never look at, and callers that supply their own .sample file discard
+    // them outright.
+    const std::vector<std::string>& sample_ids() {
+        if (sample_ids_.empty() && !header_.has_sample_ids && header_.n_samples > 0) {
+            sample_ids_.reserve(header_.n_samples);
+            for (uint32_t i = 0; i < header_.n_samples; ++i) {
+                sample_ids_.push_back("sample_" + std::to_string(i));
+            }
+        }
         return sample_ids_;
     }
 
@@ -415,18 +439,28 @@ class BgenReaderImpl::Impl {
         if (!is_open_) {
             throw std::runtime_error("BGEN file is not open");
         }
-        std::vector<uint8_t> buffer(metadata.variant_size);
-        size_t got =
-            file_reader_->read_at(metadata.file_offset, buffer.data(), metadata.variant_size);
-        if (got != metadata.variant_size) {
-            throw std::runtime_error("Failed to read complete variant record for variant " +
-                                     metadata.varid);
+        // A memory-mapped reader hands the record back in place; every other
+        // reader fills a buffer we own.
+        std::vector<uint8_t> buffer;
+        const size_t got = metadata.variant_size;
+        const uint8_t* record = file_reader_->view_at(metadata.file_offset, metadata.variant_size);
+        if (!record) {
+            buffer.resize(metadata.variant_size);
+            if (file_reader_->read_at(metadata.file_offset, buffer.data(), metadata.variant_size) !=
+                got) {
+                // BGI-sourced metadata carries no varid, so identify the record
+                // by where it starts as well.
+                throw std::runtime_error("Failed to read complete variant record for variant " +
+                                         metadata.varid + " at offset " +
+                                         std::to_string(metadata.file_offset));
+            }
+            record = buffer.data();
         }
 
         auto layout_type = static_cast<LayoutType>(header_.layout);
         auto compression_type = static_cast<CompressionType>(header_.compression);
         auto parse_result =
-            VariantParser::parse(buffer.data(), got, layout_type, compression_type, header_.n_samples);
+            VariantParser::parse(record, got, layout_type, compression_type, header_.n_samples);
         size_t goff = parse_result.first.genotype_offset;   // relative to record start
         size_t glen = parse_result.first.genotype_length;
         // Guard against a BGI size_in_bytes that understates the record (would
@@ -435,25 +469,136 @@ class BgenReaderImpl::Impl {
             throw std::runtime_error("Variant record smaller than BGI size_in_bytes for variant " +
                                      metadata.varid);
         }
-        return decompress_genotype_block(buffer.data() + goff, glen, metadata.file_offset,
+        return decompress_genotype_block(record + goff, glen, metadata.file_offset,
                                          metadata.varid);
     }
 
-    // One variant's compressed payload, read on the main thread in Phase 1.
+    // Range and missing-call summary for one decoded column, gathered while the
+    // values are still in cache. NaN compares false against everything, so it
+    // never moves the bounds; it is picked up by the self-comparison instead.
+    template <typename T>
+    static DosageStats scan_dosages_scalar(const T* values, size_t n) {
+        double lo = std::numeric_limits<double>::infinity();
+        double hi = -std::numeric_limits<double>::infinity();
+        bool nan_seen = false;
+        for (size_t k = 0; k < n; ++k) {
+            const double v = static_cast<double>(values[k]);
+            nan_seen |= (v != v);
+            if (v < lo) {
+                lo = v;
+            }
+            if (v > hi) {
+                hi = v;
+            }
+        }
+        return DosageStats{lo, hi, nan_seen};
+    }
+
+    template <typename T>
+    static DosageStats scan_dosages(const T* values, size_t n) {
+        return scan_dosages_scalar(values, n);
+    }
+
+#if defined(__AVX2__)
+    // The scalar loop above will not auto-vectorize, and cannot be made to:
+    // vminpd returns its second operand when either is NaN, so a NaN would
+    // poison the accumulator, and the compiler will not reorder around that.
+    // std::fmin / std::fmax have the semantics we want but compile to calls and
+    // measure three times slower still. Replacing NaN lanes with the identity
+    // before the vector min/max makes the vector form exact, and it runs 2.6x
+    // faster than the scalar loop on this scan, which is 5-12% of a decode.
+    //
+    // Only the double column is vectorized. It is the default output type and
+    // the one the measurements above are for; a float column is half the bytes,
+    // so it keeps the scalar loop rather than a second copy of this.
+    // A non-template overload, which wins over the template above for an exact
+    // double match. An explicit specialization is not allowed at class scope.
+    static DosageStats scan_dosages(const double* values, size_t n) {
+        const __m256d pos_inf = _mm256_set1_pd(std::numeric_limits<double>::infinity());
+        const __m256d neg_inf = _mm256_set1_pd(-std::numeric_limits<double>::infinity());
+        const __m256d all_ones = _mm256_castsi256_pd(_mm256_set1_epi32(-1));
+        __m256d lo_v = pos_inf;
+        __m256d hi_v = neg_inf;
+        __m256d nan_v = _mm256_setzero_pd();
+
+        size_t k = 0;
+        for (; k + 4 <= n; k += 4) {
+            const __m256d v = _mm256_loadu_pd(values + k);
+            // Lanes that are not NaN compare ordered against themselves.
+            const __m256d ordered = _mm256_cmp_pd(v, v, _CMP_ORD_Q);
+            nan_v = _mm256_or_pd(nan_v, _mm256_andnot_pd(ordered, all_ones));
+            lo_v = _mm256_min_pd(lo_v, _mm256_blendv_pd(pos_inf, v, ordered));
+            hi_v = _mm256_max_pd(hi_v, _mm256_blendv_pd(neg_inf, v, ordered));
+        }
+
+        double lo_lanes[4];
+        double hi_lanes[4];
+        _mm256_storeu_pd(lo_lanes, lo_v);
+        _mm256_storeu_pd(hi_lanes, hi_v);
+        double lo = lo_lanes[0];
+        double hi = hi_lanes[0];
+        for (int lane = 1; lane < 4; ++lane) {
+            if (lo_lanes[lane] < lo) {
+                lo = lo_lanes[lane];
+            }
+            if (hi_lanes[lane] > hi) {
+                hi = hi_lanes[lane];
+            }
+        }
+        bool nan_seen = _mm256_movemask_pd(nan_v) != 0;
+
+        // Tail, and the whole column when it is shorter than one vector.
+        for (; k < n; ++k) {
+            const double v = values[k];
+            nan_seen |= (v != v);
+            if (v < lo) {
+                lo = v;
+            }
+            if (v > hi) {
+                hi = v;
+            }
+        }
+        return DosageStats{lo, hi, nan_seen};
+    }
+#endif  // __AVX2__
+
+    // Fold per-variant summaries into one. DosageStats defaults to +inf/-inf,
+    // so an entry no worker wrote leaves the combined bounds unchanged instead
+    // of dragging them toward zero.
+    static DosageStats combine_dosage_stats(const std::vector<DosageStats>& parts) {
+        DosageStats out{std::numeric_limits<double>::infinity(),
+                        -std::numeric_limits<double>::infinity(), false};
+        for (const DosageStats& p : parts) {
+            if (p.min_value < out.min_value) {
+                out.min_value = p.min_value;
+            }
+            if (p.max_value > out.max_value) {
+                out.max_value = p.max_value;
+            }
+            out.has_nan = out.has_nan || p.has_nan;
+        }
+        return out;
+    }
+
+    // One variant's compressed payload, located on the main thread in Phase 1.
     struct CompressedJob {
-        std::vector<uint8_t> raw;  // owned compressed bytes (incl. v1.2 D field)
-        const uint8_t* compressed_ptr;      // compressed payload within raw (D field stripped)
+        // Owned copy of the record, used only when the reader cannot hand out a
+        // view; left empty when compressed_ptr points into a mapping instead.
+        std::vector<uint8_t> raw;
+        const uint8_t* compressed_ptr;      // compressed payload (D field stripped)
         size_t compressed_size;
         size_t uncompressed_size;  // decompressed size
         uint64_t offset;
         uint16_t n_alleles;
     };
 
-    // Phase 1 (main thread): read each variant's compressed bytes via
-    // file_reader_ and locate the compressed payload + decoded size. All
-    // file I/O happens here, so the GIL (for the Python-backed fsspec reader)
-    // and the non-thread-safe RegularFileReader stream are only touched on the
-    // calling thread; the parallel phase below never does I/O.
+    // Phase 1 (main thread): locate each variant's compressed payload and its
+    // decoded size. All file I/O happens here, so the GIL (for the Python-backed
+    // fsspec reader) and the non-thread-safe RegularFileReader stream are only
+    // touched on the calling thread; the parallel phase below never does I/O.
+    // A memory-mapped reader can point at the record in place, so for a local
+    // file this phase copies nothing and the pages are first touched by the
+    // worker threads instead.
     std::vector<CompressedJob> read_compressed_block(const VariantMetadata* block,
                                                      size_t n_variants,
                                                      decompress::CompressionType comp_type) {
@@ -463,19 +608,53 @@ class BgenReaderImpl::Impl {
         // from the decompress:: one this method is parameterized on).
         const auto fmt_comp = static_cast<CompressionType>(header_.compression);
         std::vector<CompressedJob> jobs(n_variants);
+
+        // One-GET path: take each whole record (variant_size bytes at
+        // file_offset) and parse the ID block in-buffer to locate the genotype
+        // slice, so a scattered remote read costs 1 GET/variant.
+        //
+        // Records the reader can show us in place cost nothing; the rest are
+        // fetched in a single read_many so a remote store has them all in flight
+        // at once instead of paying one round trip after another.
+        std::vector<const uint8_t*> records(n_variants, nullptr);
+        std::vector<uint64_t> fetch_offsets;
+        std::vector<size_t> fetch_sizes;
+        std::vector<uint8_t*> fetch_buffers;
+        std::vector<size_t> fetch_indices;
+        for (size_t i = 0; i < n_variants; ++i) {
+            const VariantMetadata& md = block[i];
+            records[i] = file_reader_->view_at(md.file_offset, md.variant_size);
+            if (!records[i]) {
+                jobs[i].raw.resize(md.variant_size);
+                fetch_offsets.push_back(md.file_offset);
+                fetch_sizes.push_back(md.variant_size);
+                fetch_buffers.push_back(jobs[i].raw.data());
+                fetch_indices.push_back(i);
+            }
+        }
+        if (!fetch_indices.empty()) {
+            std::vector<size_t> bytes_read(fetch_indices.size(), 0);
+            file_reader_->read_many(fetch_offsets.data(), fetch_sizes.data(), fetch_buffers.data(),
+                                    bytes_read.data(), fetch_indices.size());
+            for (size_t k = 0; k < fetch_indices.size(); ++k) {
+                const size_t i = fetch_indices[k];
+                if (bytes_read[k] != fetch_sizes[k]) {
+                    // BGI-sourced metadata carries no varid, so identify the
+                    // record by where it starts as well.
+                    throw std::runtime_error("Failed to read complete variant record for variant " +
+                                             block[i].varid + " at offset " +
+                                             std::to_string(block[i].file_offset));
+                }
+                records[i] = jobs[i].raw.data();
+            }
+        }
+
         for (size_t i = 0; i < n_variants; ++i) {
             const VariantMetadata& md = block[i];
             CompressedJob& j = jobs[i];
-            // One-GET path: read the whole record (variant_size bytes at
-            // file_offset) and parse the ID block in-buffer to locate the genotype
-            // slice, so a scattered remote read costs 1 GET/variant.
-            j.raw.resize(md.variant_size);
-            size_t got = file_reader_->read_at(md.file_offset, j.raw.data(), md.variant_size);
-            if (got != md.variant_size) {
-                throw std::runtime_error("Failed to read complete variant record for variant " +
-                                         md.varid);
-            }
-            auto pr = VariantParser::parse(j.raw.data(), got, layout, fmt_comp, n_samples);
+            const size_t got = md.variant_size;
+            const uint8_t* record = records[i];
+            auto pr = VariantParser::parse(record, got, layout, fmt_comp, n_samples);
             size_t goff = pr.first.genotype_offset;
             size_t glen = pr.first.genotype_length;
             if (goff + glen > got) {
@@ -485,7 +664,7 @@ class BgenReaderImpl::Impl {
             const uint8_t* dp;
             size_t compressed_size;
             size_t uncompressed_size;
-            locate_genotype_payload(j.raw.data() + goff, glen, comp_type, dp, compressed_size,
+            locate_genotype_payload(record + goff, glen, comp_type, dp, compressed_size,
                                     uncompressed_size);
             j.compressed_ptr = dp;
             j.compressed_size = compressed_size;
@@ -504,7 +683,7 @@ class BgenReaderImpl::Impl {
     template <typename DecodeFn>
     void parallel_inflate_decode(std::vector<CompressedJob>& jobs,
                                  decompress::CompressionType comp_type, size_t num_threads,
-                                 DecodeFn decode) {
+                                 DecodeFn decode, size_t column_bytes = 0) {
         const size_t n_variants = jobs.size();
         if (n_variants == 0) {
             return;
@@ -517,6 +696,31 @@ class BgenReaderImpl::Impl {
             hw = n_variants;
         }
 
+        // Workers claim runs of adjacent variants rather than one at a time.
+        // The output is a fresh column-major matrix whose pages the kernel maps
+        // on first touch. Claiming one variant at a time puts every worker on
+        // adjacent columns at the same moment, so they all first-touch the same
+        // region and serialize in the kernel: page-table locking, made worse by
+        // the transparent huge pages NumPy asks for on large arrays. The decode
+        // then runs no faster than a single-threaded write of its own output.
+        // Giving each worker a run of columns spreads those first touches out.
+        //
+        // The run targets a few megabytes of output. That is tuned, not derived:
+        // throughput is flat between roughly 2 and 8 MB and falls off past about
+        // 16 MB as the tail of the work stops dividing evenly. Runs are capped
+        // so every worker still gets several claims, which bounds how unevenly
+        // the work can land. At biobank sample counts a single column already
+        // exceeds the target, so the run collapses to one variant, i.e. to
+        // claiming one at a time. column_bytes == 0 (a caller that does not know
+        // its output geometry) claims one at a time too.
+        size_t chunk = 1;
+        if (column_bytes > 0) {
+            const size_t run_target_bytes = static_cast<size_t>(4) << 20;
+            const size_t per_run = (run_target_bytes + column_bytes - 1) / column_bytes;
+            const size_t claims_per_worker = n_variants / (hw * 4);
+            chunk = std::max<size_t>(1, std::min(per_run, claims_per_worker));
+        }
+
         std::atomic<size_t> next{0};
         std::atomic<bool> failed{false};
         std::mutex err_mu;
@@ -524,8 +728,10 @@ class BgenReaderImpl::Impl {
 
         auto worker = [&]() {
             std::vector<uint8_t> decomp;
-            size_t i;
-            while ((i = next.fetch_add(1)) < n_variants) {
+            size_t run_start;
+            while ((run_start = next.fetch_add(chunk)) < n_variants) {
+              const size_t run_end = std::min(n_variants, run_start + chunk);
+              for (size_t i = run_start; i < run_end; ++i) {
                 if (failed.load(std::memory_order_relaxed)) {
                     return;
                 }
@@ -564,6 +770,7 @@ class BgenReaderImpl::Impl {
                     }
                     return;
                 }
+              }
             }
         };
 
@@ -612,7 +819,7 @@ class BgenReaderImpl::Impl {
     // decode callback is invoked as decode(i, buf, size, job, layout, n_samples).
     template <typename DecodeStep>
     void read_decode_block_impl(const VariantMetadata* block, size_t n_variants, size_t num_threads,
-                                DecodeStep decode_step) {
+                                DecodeStep decode_step, size_t column_bytes = 0) {
         if (!is_open_) {
             throw std::runtime_error("BGEN file is not open");
         }
@@ -633,22 +840,30 @@ class BgenReaderImpl::Impl {
             jobs, comp_type, num_threads,
             [&](size_t i, const uint8_t* buf, size_t size, const CompressedJob& j) {
                 decode_step(i, buf, size, j, layout, n_samples);
-            });
+            },
+            column_bytes);
     }
 
     template <typename T>
     void read_decode_block_parallel(const VariantMetadata* block, size_t n_variants, T* out,
                                     size_t out_stride, size_t num_threads) {
+        // One slot per variant, written only by the worker that decoded it, so
+        // the summary costs no synchronization.
+        std::vector<DosageStats> per_variant(n_variants);
         read_decode_block_impl(
             block, n_variants, num_threads,
             [&](size_t i, const uint8_t* buf, size_t size, const CompressedJob& j,
                 ::lazybgen::bgen::LayoutType layout, uint32_t n_samples) {
                 // Data is already decompressed; pass the format-layer
                 // CompressionType::None (distinct from decompress::).
+                T* column = out + i * out_stride;
                 ::lazybgen::bgen::GenotypeParser::compute_dosages_direct(
                     buf, size, layout, ::lazybgen::bgen::CompressionType::None, n_samples,
-                    j.n_alleles, out + i * out_stride);
-            });
+                    j.n_alleles, column);
+                per_variant[i] = scan_dosages(column, n_samples);
+            },
+            out_stride * sizeof(T));
+        last_block_stats_ = combine_dosage_stats(per_variant);
     }
 
     // Batched parallel read + decode of a sample-FILTERED (cohort) block. Variant
@@ -661,13 +876,22 @@ class BgenReaderImpl::Impl {
     void read_decode_block_filtered_parallel(const VariantMetadata* block, size_t n_variants,
                                              const int* sample_indices, int n_indices, T* out,
                                              size_t out_stride, size_t num_threads) {
+        std::vector<DosageStats> per_variant(n_variants);
         read_decode_block_impl(
             block, n_variants, num_threads,
             [&](size_t i, const uint8_t* buf, size_t size, const CompressedJob& j,
                 ::lazybgen::bgen::LayoutType layout, uint32_t n_samples) {
-                filtered_decode_into(out + i * out_stride, buf, size, layout, n_samples,
-                                     j.n_alleles, sample_indices, n_indices);
-            });
+                T* column = out + i * out_stride;
+                filtered_decode_into(column, buf, size, layout, n_samples, j.n_alleles,
+                                     sample_indices, n_indices);
+                per_variant[i] = scan_dosages(column, static_cast<size_t>(n_indices));
+            },
+            out_stride * sizeof(T));
+        last_block_stats_ = combine_dosage_stats(per_variant);
+    }
+
+    const DosageStats& last_block_stats() const {
+        return last_block_stats_;
     }
 
     size_t num_threads() const {
@@ -732,11 +956,11 @@ class BgenReaderImpl::Impl {
 
    private:
     // Open the BGEN file
-    void open_file(PyObject* storage_options) {
+    void open_file(PyObject* storage_options, const std::string& remote_transport) {
         // Create appropriate reader based on filename
         if (is_remote_scheme(filename_)) {
             file_reader_ = std::unique_ptr<FsspecFileReader>(
-                new FsspecFileReader(filename_, storage_options));
+                new FsspecFileReader(filename_, storage_options, remote_transport));
         } else {
             // Try memory-mapped file first for local files
             try {
@@ -840,13 +1064,9 @@ class BgenReaderImpl::Impl {
 
             // Update offset to skip sample block
             header_.offset = sample_block_pos + block_size_with_n + 4;
-        } else {
-            // Generate default sample IDs
-            sample_ids_.reserve(header_.n_samples);
-            for (uint32_t i = 0; i < header_.n_samples; ++i) {
-                sample_ids_.push_back("sample_" + std::to_string(i));
-            }
         }
+        // With no sample block there is nothing to read; sample_ids() builds the
+        // placeholder IDs if anyone asks for them.
     }
 
     // Create default decompressor
@@ -867,6 +1087,8 @@ class BgenReaderImpl::Impl {
     std::unique_ptr<decompress::VariantDecompressor> decompressor_;
     BgenHeader header_;
     std::vector<std::string> sample_ids_;
+    DosageStats last_block_stats_{std::numeric_limits<double>::infinity(),
+                                  -std::numeric_limits<double>::infinity(), false};
     bool is_open_;
     size_t num_threads_ = 0;
     std::string decompressor_type_;
@@ -875,8 +1097,9 @@ class BgenReaderImpl::Impl {
 // BgenReaderImpl public methods (forwarding to pimpl)
 
 BgenReaderImpl::BgenReaderImpl(const std::string& filename, const std::string& bgi_filename,
-                               PyObject* storage_options)
-    : pimpl_(std::unique_ptr<Impl>(new Impl(filename, bgi_filename, storage_options))) {}
+                               PyObject* storage_options, const std::string& remote_transport)
+    : pimpl_(std::unique_ptr<Impl>(
+          new Impl(filename, bgi_filename, storage_options, remote_transport))) {}
 
 BgenReaderImpl::~BgenReaderImpl() = default;
 
@@ -884,8 +1107,12 @@ const BgenHeader& BgenReaderImpl::header() const {
     return pimpl_->header();
 }
 
-std::vector<std::string> BgenReaderImpl::sample_ids() {
+const std::vector<std::string>& BgenReaderImpl::sample_ids() {
     return pimpl_->sample_ids();
+}
+
+const DosageStats& BgenReaderImpl::last_block_stats() const {
+    return pimpl_->last_block_stats();
 }
 
 std::vector<VariantMetadata> BgenReaderImpl::build_metadata_from_index(

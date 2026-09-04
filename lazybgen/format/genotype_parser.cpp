@@ -246,8 +246,8 @@ void GenotypeParser::compute_dosages_v12_direct(const uint8_t* buffer, size_t si
 
     // Validate the buffer holds all probability data BEFORE reading it. Two
     // stored probabilities per sample (diploid biallelic), bits_per_prob bits
-    // each. The previous post-loop check ran only after the read loop had
-    // already walked past the end of a truncated buffer. Use division against
+    // each. Checking after the loop instead would mean the read had already
+    // walked past the end of a truncated buffer. Use division against
     // the remaining byte count so the bound check cannot overflow (relevant on
     // 32-bit size_t); bytes_per_sample is 2, 4, or 8 (never 0).
     size_t bytes_per_sample = (bits_per_prob / 8) * 2;
@@ -260,9 +260,9 @@ void GenotypeParser::compute_dosages_v12_direct(const uint8_t* buffer, size_t si
     // Single-pass processing: read missing status and probabilities together
     const uint8_t* prob_ptr = ptr;
 
-    // NOTE: this all-samples decode is intentionally scalar. SIMD-vectorizing the
-    // arithmetic was tried and measured to give no speedup (~3% at best for f32,
-    // a slight regression for f64): a native profile shows the kernel's wall time
+    // NOTE: this all-samples decode is intentionally scalar. Vectorizing the
+    // arithmetic buys nothing here (~3% at best for f32, a slight regression for
+    // f64): the kernel's wall time
     // is unchanged because it is bound by the per-sample loads/stores and the
     // missing/invalid branch, not the multiply/divide. Decompression (~50%) is
     // the real floor; parallelism (read_decode_block_parallel) and dtype=float32

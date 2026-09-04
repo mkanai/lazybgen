@@ -7,8 +7,8 @@ that real missingness, both full and sample-filtered; pin sequential vs parallel
 decoder equivalence including the NaN mask; and guard the SIMD decode paths
 against returning a computed dosage for a genotype flagged missing.
 
-This is the real coverage of the error / mean / omit / warn paths on genuinely
-missing data (previous tests ran them only on clean fixtures).
+This is the coverage of the error / mean / omit / warn paths on genuinely
+missing data; a clean fixture cannot exercise any of them.
 """
 
 import warnings
@@ -398,3 +398,125 @@ def test_filtered_8bit_missing_in_avx2_chunk_is_nan():
             rtol=1e-6,
             atol=1e-6,
         )
+
+
+# ---------------------------------------------------------------------------
+# Dosage validation: range check and NaN detection share the same scan
+# ---------------------------------------------------------------------------
+def test_validate_dosages_reports_nan_presence():
+    """_validate_dosages answers "in range?" and "any NaN?" from one min/max pair.
+
+    np.min / np.max propagate NaN, so the range scan already reveals whether the
+    matrix holds missing data; the caller must not need a separate isnan pass.
+    """
+    from lazybgen import _validate_dosages
+
+    clean = np.array([[0.0, 1.0], [2.0, 0.5]])
+    assert _validate_dosages(clean) is False
+
+    with_nan = clean.copy()
+    with_nan[0, 1] = np.nan
+    assert _validate_dosages(with_nan) is True
+
+    # An empty result has neither a range nor a NaN to report.
+    assert _validate_dosages(np.empty((0, 0))) is False
+
+
+def test_validate_dosages_rejects_out_of_range():
+    """Values outside [0, 2] raise, including alongside NaNs; all-NaN does not."""
+    from lazybgen import _validate_dosages
+
+    for bad in (-0.5, 2.5):
+        with pytest.raises(ValueError, match="out of valid range"):
+            _validate_dosages(np.array([[0.0, bad]]))
+
+    # A NaN must not mask an out-of-range value.
+    with pytest.raises(ValueError, match="out of valid range"):
+        _validate_dosages(np.array([[np.nan, 2.5]]))
+
+    # All-NaN is missing data, not a range error.
+    assert _validate_dosages(np.full((2, 2), np.nan)) is True
+
+    # +/-inf is not NaN, so it flows through the range check and is caught.
+    with pytest.raises(ValueError, match="out of valid range"):
+        _validate_dosages(np.array([[0.0, np.inf]]))
+
+
+@pytest.fixture(scope="module")
+def test_paths_basic():
+    """A fixture with no missing calls."""
+    return str(DATA_DIR / "data.bgen")
+
+
+# ---------------------------------------------------------------------------
+# Dosage stats gathered during the parallel decode
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("key,fname", sorted(MISSING_FIXTURES.items()))
+def test_parallel_decode_reports_dosage_stats(key, fname):
+    """The block decode reports the range and NaN presence it wrote.
+
+    These fixtures carry real missing calls, so has_nan must be True and the
+    reported min/max must ignore the NaNs, matching nanmin/nanmax exactly.
+    """
+    path = str(DATA_DIR / fname)
+    with BgenReader(path) as reader:
+        dosages, _ = reader.load_variants(dtype=np.float64)
+        stats = reader.last_dosage_stats
+
+    assert stats is not None
+    lo, hi, has_nan = stats
+    assert has_nan is True
+    assert lo == pytest.approx(np.nanmin(dosages))
+    assert hi == pytest.approx(np.nanmax(dosages))
+
+
+def test_dosage_stats_match_numpy_without_missing_data(test_paths_basic):
+    """On a fixture with no missing calls the stats match a plain min/max."""
+    with BgenReader(test_paths_basic) as reader:
+        dosages, _ = reader.load_variants(dtype=np.float32)
+        stats = reader.last_dosage_stats
+
+    assert stats is not None
+    lo, hi, has_nan = stats
+    assert has_nan == bool(np.isnan(dosages).any())
+    assert lo == pytest.approx(np.nanmin(dosages), abs=1e-6)
+    assert hi == pytest.approx(np.nanmax(dosages), abs=1e-6)
+
+
+def test_dosage_stats_cover_sample_filtered_decode():
+    """A sample-filtered decode reports stats for the rows it actually wrote."""
+    path = str(DATA_DIR / MISSING_FIXTURES["16bit"])
+    indices = np.array([0, 1, 2, 3, 4], dtype=np.int32)
+    with BgenReader(path) as reader:
+        dosages, _ = reader.load_variants(sample_indices=indices, dtype=np.float64)
+        stats = reader.last_dosage_stats
+
+    assert stats is not None
+    lo, hi, has_nan = stats
+    assert has_nan == bool(np.isnan(dosages).any())
+    assert lo == pytest.approx(np.nanmin(dosages))
+    assert hi == pytest.approx(np.nanmax(dosages))
+
+
+def test_dosage_stats_absent_for_the_serial_path():
+    """The per-variant serial loop gathers no stats, so none are reported.
+
+    load_bgen must fall back to scanning the matrix in that case, so reporting
+    None (rather than a stale answer from an earlier load) is what makes the
+    fallback safe.
+    """
+    path = str(DATA_DIR / MISSING_FIXTURES["16bit"])
+    with BgenReader(path, num_threads=1) as reader:
+        reader.load_variants(dtype=np.float64)
+        assert reader.last_dosage_stats is None
+
+
+def test_dosage_stats_are_reset_between_loads():
+    """Stats never leak from one load into the next."""
+    path = str(DATA_DIR / MISSING_FIXTURES["16bit"])
+    with BgenReader(path) as reader:
+        reader.load_variants(dtype=np.float64)
+        assert reader.last_dosage_stats is not None
+        reader.set_decompressor_type("sequential", 1)
+        reader.load_variants(dtype=np.float64)
+        assert reader.last_dosage_stats is None
