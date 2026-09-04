@@ -28,10 +28,57 @@ REMOTE_SCHEMES = ("gs://", "s3://")
 # fsspec registers gcsfs under "gs"/"gcs" and s3fs under "s3"; map scheme -> pip pkg.
 _PACKAGE_FOR_SCHEME = {"gs": "gcsfs", "s3": "s3fs"}
 
+# Transports that can serve a remote read. "obstore" runs HTTP and TLS in Rust
+# with the GIL released, which lets one process overlap several range requests
+# instead of funnelling them through fsspec's single event loop; "fsspec" is
+# gcsfs / s3fs. "auto" prefers obstore when it is importable and can express the
+# caller's storage_options, and falls back to fsspec otherwise. obstore ships as
+# a dependency, but the fallback stays supported: a user can deselect it, and
+# some storage_options have no obstore equivalent.
+REMOTE_BACKENDS = ("auto", "fsspec", "obstore")
+_DEFAULT_REMOTE_BACKEND = "auto"
+
 
 def is_remote_path(path: str) -> bool:
-    """Return True if ``path`` is a cloud URL handled by an fsspec backend."""
+    """Return True if ``path`` is a cloud URL handled by a remote backend."""
     return path.startswith(REMOTE_SCHEMES)
+
+
+def resolve_remote_backend(path: str, storage_options: Optional[Dict] = None, backend: Optional[str] = None) -> str:
+    """Pick the transport for a remote path: ``"fsspec"`` or ``"obstore"``.
+
+    ``backend`` is the caller's preference (``"auto"``, ``"fsspec"`` or
+    ``"obstore"``); when it is None the ``LAZYBGEN_REMOTE_BACKEND`` environment
+    variable is consulted, then the default of ``"auto"``.
+
+    ``"auto"`` chooses obstore only when it is installed AND every entry in
+    ``storage_options`` has an obstore equivalent, so an option that would
+    otherwise be silently dropped (and change which bytes are read) sends the
+    read back to fsspec instead. Asking for ``"obstore"`` explicitly raises
+    rather than falling back.
+    """
+    if backend is None:
+        backend = os.environ.get("LAZYBGEN_REMOTE_BACKEND") or _DEFAULT_REMOTE_BACKEND
+    backend = backend.lower()
+    if backend not in REMOTE_BACKENDS:
+        raise ValueError(f"remote_backend must be one of {REMOTE_BACKENDS}, got {backend!r}")
+    if backend == "fsspec":
+        return "fsspec"
+
+    from . import obstore_backend
+
+    scheme = path.split("://", 1)[0]
+    if backend == "obstore":
+        if not obstore_backend.is_available():
+            raise ImportError(
+                "remote_backend='obstore' requires the obstore package, which lazybgen "
+                "normally installs: pip install obstore"
+            )
+        # Raises UnsupportedStorageOption naming the offending key.
+        obstore_backend.translate_storage_options(scheme, storage_options)
+        return "obstore"
+
+    return "obstore" if obstore_backend.can_handle(scheme, storage_options) else "fsspec"
 
 
 def choose_remote_block_size(nsamples: int, offsets) -> int:
@@ -142,7 +189,7 @@ def _local_bgi_cache_path(bgi_path: str, storage_options: Optional[Dict] = None)
 _bgi_memory_cache: Dict[str, str] = {}
 
 
-def ensure_local_bgi(bgi_path: str, storage_options: Optional[Dict] = None) -> str:
+def ensure_local_bgi(bgi_path: str, storage_options: Optional[Dict] = None, backend: Optional[str] = None) -> str:
     """
     Ensure BGI file is available locally, downloading from a remote URL if needed.
 
@@ -163,6 +210,8 @@ def ensure_local_bgi(bgi_path: str, storage_options: Optional[Dict] = None) -> s
         Extra keyword arguments forwarded to ``fsspec.filesystem`` (e.g.
         ``{"requester_pays": True}`` for GCS requester-pays buckets, or
         ``{"anon": True}`` for public buckets).
+    backend : str, optional
+        Transport preference, as for :func:`resolve_remote_backend`.
 
     Returns
     -------
@@ -209,12 +258,22 @@ def ensure_local_bgi(bgi_path: str, storage_options: Optional[Dict] = None) -> s
     max_retries = 3
     retry_delay = 1.0
 
+    # The index is downloaded through the same transport the genotype reads will
+    # use, so a caller that has only one of the two backends installed still works.
+    use_obstore = resolve_remote_backend(bgi_path, storage_options, backend) == "obstore"
+
     for attempt in range(max_retries):
         try:
-            import fsspec
+            if use_obstore:
+                from .obstore_backend import ObstoreFileSystem
+
+                download = ObstoreFileSystem(**(storage_options or {})).download
+            else:
+                import fsspec
+
+                download = fsspec.filesystem(scheme, **(storage_options or {})).get
 
             logger.info(f"Downloading BGI index from {bgi_path} to {local_path}...")
-            fs = fsspec.filesystem(scheme, **(storage_options or {}))
             # Download to a unique temp file in the SAME directory, then atomically
             # rename into place. os.replace is atomic on a single filesystem, so a
             # concurrent process never observes a partially written .bgi and a
@@ -222,7 +281,7 @@ def ensure_local_bgi(bgi_path: str, storage_options: Optional[Dict] = None) -> s
             fd, tmp_path = tempfile.mkstemp(dir=cache_dir, prefix=".tmp-", suffix=".bgi")
             os.close(fd)
             try:
-                fs.get(bgi_path, tmp_path)
+                download(bgi_path, tmp_path)
                 os.replace(tmp_path, local_path)
             except BaseException:
                 # Clean up the partial temp file on any failure.

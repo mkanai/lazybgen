@@ -16,7 +16,7 @@ import pandas as pd
 from typing import Optional, List, Tuple, Dict, Any, Callable, Union
 import logging
 
-from .remote import is_remote_path, choose_remote_block_size
+from .remote import is_remote_path, choose_remote_block_size, resolve_remote_backend
 from .region import validate_region_bounds
 
 
@@ -67,7 +67,8 @@ cdef class BgenReader:
     def __init__(self, file_path: str, bgi_path: Optional[str] = None,
                  sample_path: Optional[str] = None,
                  num_threads: int = 0,
-                 storage_options: Optional[dict] = None):
+                 storage_options: Optional[dict] = None,
+                 remote_backend: Optional[str] = None):
         """
         Initialize BGEN reader.
 
@@ -90,10 +91,25 @@ cdef class BgenReader:
             for public S3, or for GCS requester-pays buckets {"requester_pays": True}
             to bill the environment's default project or {"requester_pays":
             "billing-project-id"} to bill a specific one). Ignored for local files.
+        remote_backend : str, optional
+            Transport for gs:// and s3:// reads: "obstore", "fsspec" (gcsfs /
+            s3fs), or "auto". "auto" (the default, overridable with the
+            LAZYBGEN_REMOTE_BACKEND environment variable) uses obstore when it is
+            installed and can express every storage_options entry, and fsspec
+            otherwise. obstore moves several times more bytes per second per
+            process, because it runs HTTP and TLS outside the GIL rather than
+            through fsspec's single event loop. Ignored for local files.
         """
         self.file_path = file_path
         self.bgi_path = bgi_path or (file_path + '.bgi')
         self.storage_options = storage_options
+        # Resolved once here rather than per read, so every path of one reader
+        # (index download, header parse, genotype fetch) uses the same transport.
+        self.remote_backend = (
+            resolve_remote_backend(file_path, storage_options, remote_backend)
+            if is_remote_path(file_path) or is_remote_path(self.bgi_path)
+            else 'fsspec'
+        )
         self.is_open = False
         # Anchored at construction: the rows are parsed on first access to the
         # `samples` property, so a relative path left unresolved would follow the
@@ -148,7 +164,7 @@ cdef class BgenReader:
             # Download the remote BGI index into the local cache directory, then
             # pass the local path to C++.
             from .remote import ensure_local_bgi
-            local_bgi_path = ensure_local_bgi(self.bgi_path, self.storage_options)
+            local_bgi_path = ensure_local_bgi(self.bgi_path, self.storage_options, self.remote_backend)
             cpp_bgi_path = local_bgi_path.encode('utf-8')
             # Update self.bgi_path to the local path for consistency
             self.bgi_path = local_bgi_path
@@ -157,7 +173,8 @@ cdef class BgenReader:
         
         try:
             # Create main reader
-            self.impl.reset(new BgenReaderImpl(cpp_file_path, cpp_bgi_path, self.storage_options))
+            self.impl.reset(new BgenReaderImpl(cpp_file_path, cpp_bgi_path, self.storage_options,
+                                               self.remote_backend.encode('utf-8')))
             
             # Store header info
             self.header_info = self.impl.get().header()

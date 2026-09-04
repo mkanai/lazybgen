@@ -134,7 +134,8 @@ cdef extern from "bgen_reader_impl.h" namespace "lazybgen::io::bgen":
         bool has_nan
 
     cdef cppclass BgenReaderImpl:
-        BgenReaderImpl(const string& filename, const string& bgi_filename, object storage_options) except +
+        BgenReaderImpl(const string& filename, const string& bgi_filename, object storage_options,
+                       const string& remote_transport) except +
         
         # Header access
         const BgenHeader& header() except +
@@ -186,6 +187,7 @@ cdef class BgenReader:
     cdef str sample_path
     cdef object dosage_stats
     cdef object storage_options
+    cdef public str remote_backend
 
     # Private methods
     cdef void _init_reader(self) except *

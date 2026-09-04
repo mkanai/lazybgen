@@ -77,7 +77,10 @@ def stand_in_gcs(monkeypatch):
 
 
 def _open_remote():
-    return BgenReader(REMOTE_URL, bgi_path=str(LOCAL_BGI))
+    # Pinned to fsspec: the stand-in above replaces gcsfs.GCSFileSystem, which is
+    # the transport under test here. The obstore transport has its own stand-in
+    # in test_obstore_remote_reads.py.
+    return BgenReader(REMOTE_URL, bgi_path=str(LOCAL_BGI), remote_backend="fsspec")
 
 
 def test_batched_remote_read_matches_a_local_read(stand_in_gcs):

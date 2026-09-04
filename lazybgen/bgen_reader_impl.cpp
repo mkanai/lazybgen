@@ -271,7 +271,7 @@ class BgenReaderImpl::Impl {
    public:
     // Constructor
     Impl(const std::string& filename, const std::string& bgi_filename,
-         PyObject* storage_options = nullptr)
+         PyObject* storage_options = nullptr, const std::string& remote_transport = "fsspec")
         : filename_(filename),
           bgi_filename_(bgi_filename),
           file_reader_(),
@@ -284,7 +284,7 @@ class BgenReaderImpl::Impl {
           decompressor_type_("sequential") {
         try {
             // Open the BGEN file
-            open_file(storage_options);
+            open_file(storage_options, remote_transport);
 
             // Read and parse header
             parse_header();
@@ -956,11 +956,11 @@ class BgenReaderImpl::Impl {
 
    private:
     // Open the BGEN file
-    void open_file(PyObject* storage_options) {
+    void open_file(PyObject* storage_options, const std::string& remote_transport) {
         // Create appropriate reader based on filename
         if (is_remote_scheme(filename_)) {
             file_reader_ = std::unique_ptr<FsspecFileReader>(
-                new FsspecFileReader(filename_, storage_options));
+                new FsspecFileReader(filename_, storage_options, remote_transport));
         } else {
             // Try memory-mapped file first for local files
             try {
@@ -1097,8 +1097,9 @@ class BgenReaderImpl::Impl {
 // BgenReaderImpl public methods (forwarding to pimpl)
 
 BgenReaderImpl::BgenReaderImpl(const std::string& filename, const std::string& bgi_filename,
-                               PyObject* storage_options)
-    : pimpl_(std::unique_ptr<Impl>(new Impl(filename, bgi_filename, storage_options))) {}
+                               PyObject* storage_options, const std::string& remote_transport)
+    : pimpl_(std::unique_ptr<Impl>(
+          new Impl(filename, bgi_filename, storage_options, remote_transport))) {}
 
 BgenReaderImpl::~BgenReaderImpl() = default;
 

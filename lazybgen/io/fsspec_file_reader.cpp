@@ -13,8 +13,18 @@ namespace bgen {
 
 namespace {
 struct Backend { const char* module; const char* class_name; };
-// Map URL scheme -> (fsspec module, FileSystem class).
-bool backend_for(const std::string& f, Backend* out) {
+// Map (URL scheme, transport) -> (module, FileSystem class). The obstore
+// transport serves every scheme from one adapter class, which keys its own
+// store off the URL; the fsspec transport has one class per scheme. Adding a
+// scheme is one more line here plus one entry in lazybgen/remote.py.
+bool backend_for(const std::string& f, const std::string& transport, Backend* out) {
+    if (transport == "obstore") {
+        if (f.rfind("gs://", 0) == 0 || f.rfind("s3://", 0) == 0) {
+            *out = {"lazybgen.obstore_backend", "ObstoreFileSystem"};
+            return true;
+        }
+        return false;
+    }
     if (f.rfind("gs://", 0) == 0) { *out = {"gcsfs", "GCSFileSystem"}; return true; }
     if (f.rfind("s3://", 0) == 0) { *out = {"s3fs", "S3FileSystem"}; return true; }
     return false;
@@ -36,13 +46,15 @@ class GilGuard {
 }  // namespace
 
 FsspecFileReader::FsspecFileReader(const std::string& filename, PyObject* storage_options,
-                                   size_t buffer_size, size_t block_size)
+                                   const std::string& transport, size_t buffer_size,
+                                   size_t block_size)
     : fs_module_(nullptr),
       fs_(nullptr),
       file_obj_(nullptr),
       storage_options_(storage_options),
       has_cat_ranges_(false),
       filename_(filename),
+      transport_(transport.empty() ? std::string("fsspec") : transport),
       file_size_(0),
       current_pos_(0),
       is_open_(false),
@@ -51,7 +63,7 @@ FsspecFileReader::FsspecFileReader(const std::string& filename, PyObject* storag
       buffer_start_(0),
       buffer_valid_(0) {
     Backend backend;
-    if (!backend_for(filename, &backend)) {
+    if (!backend_for(filename, transport_, &backend)) {
         throw std::runtime_error("FsspecFileReader: unsupported URL scheme: " + filename);
     }
     buffer_.resize(buffer_size_);
@@ -86,7 +98,7 @@ void FsspecFileReader::initialize_python() {
     GilGuard gil;
 
     Backend backend{};
-    backend_for(filename_, &backend);  // validated in ctor
+    backend_for(filename_, transport_, &backend);  // validated in ctor
 
     fs_module_ = PyImport_ImportModule(backend.module);
     if (!fs_module_) {
@@ -478,11 +490,17 @@ void FsspecFileReader::fetch_ranges(const uint64_t* offsets, const size_t* sizes
             for (size_t i = 0; i < count; ++i) {
                 // Borrowed reference into the sequence.
                 PyObject* item = PySequence_Fast_GET_ITEM(seq, static_cast<Py_ssize_t>(i));
-                // An async filesystem (gcsfs, s3fs) hands a failed range back as
-                // the exception object in the result list rather than raising,
-                // so check every element.
-                if (!PyBytes_Check(item)) {
-                    std::string detail = "non-bytes result";
+                // Any object exposing a contiguous buffer is acceptable: fsspec
+                // returns bytes, the obstore adapter returns a view of the Rust
+                // allocation, and taking the buffer rather than the bytes keeps
+                // the latter copy-free. An async filesystem (gcsfs, s3fs) hands a
+                // failed range back as the exception object in the result list
+                // rather than raising, and an exception has no buffer, so this
+                // check catches that too.
+                Py_buffer view;
+                if (PyObject_GetBuffer(item, &view, PyBUF_SIMPLE) < 0) {
+                    PyErr_Clear();
+                    std::string detail = "result does not expose a buffer";
                     PyObject* text = PyObject_Repr(item);
                     if (text) {
                         const char* utf8 = PyUnicode_AsUTF8(text);
@@ -497,19 +515,13 @@ void FsspecFileReader::fetch_ranges(const uint64_t* offsets, const size_t* sizes
                     throw std::runtime_error("FsspecFileReader: cat_ranges failed for range at " +
                                              std::to_string(offsets[i]) + ": " + detail);
                 }
-                char* data = nullptr;
-                Py_ssize_t length = 0;
-                if (PyBytes_AsStringAndSize(item, &data, &length) < 0) {
-                    Py_DECREF(seq);
-                    Py_DECREF(result);
-                    raise_python_error("extract cat_ranges bytes");
-                }
                 // Clamp exactly as read_internal does: the destination holds only
                 // sizes[i] bytes whatever the filesystem hands back.
-                const size_t copied = std::min(static_cast<size_t>(length), sizes[i]);
+                const size_t copied = std::min(static_cast<size_t>(view.len), sizes[i]);
                 if (copied > 0) {
-                    std::memcpy(buffers[i], data, copied);
+                    std::memcpy(buffers[i], view.buf, copied);
                 }
+                PyBuffer_Release(&view);
                 out_read[i] = copied;
             }
 

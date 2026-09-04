@@ -134,6 +134,7 @@ def load_bgen(
     nan_action: str = "error",
     num_threads: int = 0,
     storage_options: Optional[Dict[str, Any]] = None,
+    remote_backend: Optional[str] = None,
 ):
     """
     Load genotype data from BGEN file.
@@ -170,6 +171,12 @@ def load_bgen(
         for public S3, or for GCS requester-pays buckets {"requester_pays": True}
         to bill the environment's default project or {"requester_pays":
         "billing-project-id"} to bill a specific one). Ignored for local files.
+    remote_backend : str, optional
+        Transport for gs:// and s3:// reads: "obstore", "fsspec" (gcsfs / s3fs),
+        or "auto". "auto" (the default, overridable with the
+        LAZYBGEN_REMOTE_BACKEND environment variable) uses obstore when it is
+        installed and can express every storage_options entry, and fsspec
+        otherwise. Ignored for local files.
 
     Returns
     -------
@@ -218,6 +225,7 @@ def load_bgen(
         bgi_path=bgi_path,
         num_threads=num_threads,
         storage_options=storage_options,
+        remote_backend=remote_backend,
     )
 
     try:

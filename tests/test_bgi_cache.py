@@ -51,7 +51,7 @@ class TestBGIMemoryCache:
         mock_fs.get = MagicMock()
 
         with patch("fsspec.filesystem", return_value=mock_fs):
-            ensure_local_bgi(gcs_path)
+            ensure_local_bgi(gcs_path, backend="fsspec")
 
             # Download is targeted at a temp file in the hashed cache dir (atomic
             # download), then os.replace-d into place; never the CWD or final path.
@@ -83,12 +83,12 @@ class TestBGIMemoryCache:
             f.write("dummy content")
 
         # First call - should reuse the cached file, no download
-        result1 = ensure_local_bgi(gcs_path)
+        result1 = ensure_local_bgi(gcs_path, backend="fsspec")
         assert result1 == expected_local
 
         # Second call - should use memory cache, no download
         with patch("fsspec.filesystem") as mock_fs_factory:
-            result2 = ensure_local_bgi(gcs_path)
+            result2 = ensure_local_bgi(gcs_path, backend="fsspec")
             assert result2 == result1
             mock_fs_factory.assert_not_called()
 
@@ -104,7 +104,7 @@ class TestBGIMemoryCache:
             mock_fs_factory.return_value = mock_fs
 
             with patch("os.path.exists", return_value=True):
-                ensure_local_bgi(gcs_path)
+                ensure_local_bgi(gcs_path, backend="fsspec")
 
         # Verify cache has content
         assert len(get_bgi_cache_info()) > 0
@@ -142,7 +142,7 @@ class TestBGIDownload:
 
         with patch("fsspec.filesystem", return_value=mock_fs):
             with patch("time.sleep"):  # Speed up test
-                result = ensure_local_bgi(gcs_path)
+                result = ensure_local_bgi(gcs_path, backend="fsspec")
                 assert result == expected_local
                 assert mock_fs.get.call_count == 3
 
@@ -161,7 +161,7 @@ class TestBGIDownload:
             with patch("fsspec.filesystem", return_value=mock_fs):
                 with patch("time.sleep"):  # Speed up test
                     with pytest.raises(RuntimeError, match="Failed to download BGI file"):
-                        ensure_local_bgi(gcs_path)
+                        ensure_local_bgi(gcs_path, backend="fsspec")
                     assert mock_fs.get.call_count == 3  # Should try 3 times
         finally:
             os.chdir(original_cwd)
@@ -173,10 +173,10 @@ class TestBGIDownload:
         monkeypatch.setenv("LAZYBGEN_BGI_CACHE_DIR", str(tmp_path))
         with patch("fsspec.filesystem", side_effect=ImportError("No module named gcsfs")):
             with pytest.raises(ImportError, match="gcsfs is required"):
-                ensure_local_bgi("gs://bucket/test.bgi")
+                ensure_local_bgi("gs://bucket/test.bgi", backend="fsspec")
         with patch("fsspec.filesystem", side_effect=ImportError("No module named s3fs")):
             with pytest.raises(ImportError, match="s3fs is required"):
-                ensure_local_bgi("s3://bucket/test.bgi")
+                ensure_local_bgi("s3://bucket/test.bgi", backend="fsspec")
 
     def test_passes_storage_options_for_s3(self, tmp_path, monkeypatch):
         monkeypatch.setenv("LAZYBGEN_BGI_CACHE_DIR", str(tmp_path))
@@ -190,7 +190,7 @@ class TestBGIDownload:
             return m
 
         with patch("fsspec.filesystem", side_effect=fake_filesystem):
-            ensure_local_bgi("s3://bucket/test.bgi", storage_options={"requester_pays": True})
+            ensure_local_bgi("s3://bucket/test.bgi", storage_options={"requester_pays": True}, backend="fsspec")
         assert captured["scheme"] == "s3"
         assert captured["kwargs"] == {"requester_pays": True}
 
@@ -301,7 +301,7 @@ def test_ensure_local_bgi_failed_download_leaves_no_partial(tmp_path, monkeypatc
     url = "gs://bucket/data.bgen.bgi"
     final = remote._local_bgi_cache_path(url)
     with pytest.raises(RuntimeError):
-        remote.ensure_local_bgi(url)
+        remote.ensure_local_bgi(url, backend="fsspec")
 
     # The final cache path must not exist (no partial caching), and no leftover
     # temp files should remain in the cache dir.
@@ -333,7 +333,7 @@ def test_ensure_local_bgi_successful_download_is_atomic(tmp_path, monkeypatch):
 
     url = "gs://bucket/data.bgen.bgi"
     final = remote._local_bgi_cache_path(url)
-    result = remote.ensure_local_bgi(url)
+    result = remote.ensure_local_bgi(url, backend="fsspec")
 
     assert result == final
     assert os.path.exists(final)

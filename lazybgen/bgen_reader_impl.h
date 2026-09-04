@@ -65,10 +65,14 @@ class BgenReaderImpl {
      *
      * @param filename Path to BGEN file
      * @param bgi_filename Path to BGI index file
+     * @param storage_options Borrowed dict of kwargs for a remote FileSystem
+     * @param remote_transport Which remote transport serves the reads,
+     *        "fsspec" or "obstore"; ignored for a local file
      * @throws std::runtime_error if files cannot be opened
      */
     BgenReaderImpl(const std::string& filename, const std::string& bgi_filename,
-                   PyObject* storage_options = nullptr);
+                   PyObject* storage_options = nullptr,
+                   const std::string& remote_transport = "fsspec");
 
     /**
      * Destructor

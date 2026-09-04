@@ -25,6 +25,11 @@ we want when optimizing lazybgen.
   commits from before the switch to libdeflate build their vendored zlib with
   it; current commits compile every vendored library directly.
 - `benchmark_commits.sh` - builds an image per commit and runs the benchmark.
+- `compare_remote_backends.py` - times the two remote transports (fsspec vs
+  obstore) on the same `gs://` / `s3://` BGEN and checks that they return
+  identical dosages:
+  `python benchmarks/compare_remote_backends.py --url gs://bucket/big.bgen`.
+  obstore is a default dependency, so both rows run out of the box.
 - `compare_results.py` - tables, CSV, plots, and regression detection across runs.
 - `analyze_profiles.py` - turns `--profile` output into reports / call graphs.
 - `generate_test_bgen.py` - regenerates the `test_data/` fixtures.
@@ -159,6 +164,13 @@ bucket, median of 3):
 | One variant              | 0.50 s                        |
 | Region (500 contiguous)  | 3.91 s                        |
 | Scattered (200 random)   | 1.52 s                        |
+
+These are the fsspec (gcsfs) transport, which is now the fallback rather than the
+default. The same reads run 1.2-1.4x faster on obstore, because it does the
+HTTP and TLS in Rust
+with the GIL released and several range requests can be genuinely in flight at
+once; see "Remote transports" in the root README, and
+`compare_remote_backends.py` to reproduce it on your own bucket.
 
 Because lazybgen fetches only the requested variants, these times are independent
 of the total variant count (file size). A block decode asks for a whole block's

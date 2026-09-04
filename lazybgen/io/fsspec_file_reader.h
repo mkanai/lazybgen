@@ -14,11 +14,13 @@ namespace io {
 namespace bgen {
 
 /**
- * FsspecFileReader - File reader implementation for fsspec-backed remote stores
+ * FsspecFileReader - File reader implementation for remote object stores
  *
- * Uses a Python fsspec backend (gcsfs / s3fs) to read BGEN files directly from
- * remote object storage without downloading the entire file. Supports efficient
- * range requests and buffering for sequential access patterns.
+ * Reads BGEN files directly from remote object storage over byte ranges, without
+ * downloading the whole file. The bytes are moved by a Python filesystem object
+ * selected per reader: fsspec (gcsfs / s3fs), or the obstore adapter in
+ * lazybgen.obstore_backend. Both expose the same info / cat_ranges / open
+ * surface, so everything below the constructor is transport-agnostic.
  */
 class FsspecFileReader : public FileReader {
    public:
@@ -26,6 +28,10 @@ class FsspecFileReader : public FileReader {
      * Constructor
      * @param filename remote path (gs:// or s3://)
      * @param storage_options borrowed dict of kwargs for the FileSystem ctor (may be NULL)
+     * @param transport which filesystem class serves the reads: "fsspec"
+     *        (gcsfs / s3fs) or "obstore". Resolved in Python, where the caller's
+     *        storage_options can be checked against what each one supports; an
+     *        empty string means "fsspec".
      * @param buffer_size Internal sequential read buffer in bytes (default 1MB).
      *        This buffer backs only the one-time header/sample-id parse at open
      *        (read()); all genotype I/O is random-access read_at that bypasses it.
@@ -37,6 +43,7 @@ class FsspecFileReader : public FileReader {
      *        header is known; a large block over-fetches on scattered selections.
      */
     explicit FsspecFileReader(const std::string& filename, PyObject* storage_options = nullptr,
+                              const std::string& transport = "fsspec",
                               size_t buffer_size = 1024 * 1024,
                               size_t block_size = 1024 * 1024);
 
@@ -82,7 +89,7 @@ class FsspecFileReader : public FileReader {
     size_t read_from_buffer(uint8_t* buffer, size_t size);
 
     // Python objects (owned references)
-    PyObject* fs_module_;        // fsspec backend module (gcsfs / s3fs)
+    PyObject* fs_module_;        // module holding the FileSystem class
     PyObject* fs_;               // FileSystem instance
     PyObject* file_obj_;         // file handle from fs.open()
     PyObject* storage_options_;  // borrowed; kwargs for the FileSystem ctor (may be NULL)
@@ -90,6 +97,7 @@ class FsspecFileReader : public FileReader {
 
     // File information
     std::string filename_;
+    std::string transport_;  // "fsspec" or "obstore"
     uint64_t file_size_;
     uint64_t current_pos_;
     bool is_open_;

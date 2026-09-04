@@ -61,6 +61,10 @@ load_bgen("gs://bucket/file.bgen", storage_options={"requester_pays": "my-billin
 load_bgen("s3://bucket/file.bgen", storage_options={"anon": True})
 ```
 
+`gs://` and `s3://` reads go through [obstore](https://developmentseed.org/obstore/)
+by default, which is 1.2-1.4x faster than gcsfs / s3fs and needs no code change.
+See [Remote transports](#remote-transports).
+
 `load_bgen` returns `(genotypes, variant_info, sample_ids)`, where `genotypes`
 is an `(n_samples, n_variants)` `np.ndarray`, `variant_info` is a `pd.DataFrame`
 with columns `chrom, pos, rsid, ref, alt`, and `sample_ids` is a `list[str]`.
@@ -88,7 +92,12 @@ A `.bgi` index is required; create one with `bgenix -g file.bgen`.
 - `num_threads`: worker threads for decoding. `0` (default) auto-detects the CPU
   core count and decodes blocks in parallel; `1` forces single-threaded decoding;
   `N > 1` uses N threads (see [Parallel decode](#parallel-decode))
-- `storage_options`: backend kwargs forwarded to the fsspec filesystem (e.g. `{"anon": True}` for public S3, `{"requester_pays": True}` to bill the env default project, or `{"requester_pays": "billing-project-id"}` for GCS requester-pays buckets)
+- `storage_options`: cloud backend kwargs, in fsspec spelling whichever transport
+  serves them (e.g. `{"anon": True}` for public S3, `{"requester_pays": True}` to
+  bill the env default project, or `{"requester_pays": "billing-project-id"}` for
+  GCS requester-pays buckets)
+- `remote_backend`: transport for `gs://` and `s3://` reads: `"auto"` (default),
+  `"obstore"`, or `"fsspec"` (see [Remote transports](#remote-transports))
 
 ### Supported BGEN features
 
@@ -115,6 +124,45 @@ v1.2 / v1.3 (re-encode with `qctool2` if needed) for production use.
 
 `from lazybgen import get_build_info` returns the compression backend the package
 was built against (vendored libdeflate / zstd, or system libraries).
+
+### Remote transports
+
+Remote reads go through one of two transports, chosen per reader by
+`remote_backend`:
+
+- **obstore**, installed by default and used by default. It runs HTTP and TLS in
+  Rust with the GIL released, so one process can have many range requests
+  genuinely in flight.
+- **fsspec** (`gcsfs` / `s3fs`), always available, and the fallback. fsspec drives
+  every request in a process through a single asyncio event loop, which pins one
+  CPU core and caps throughput there.
+
+`remote_backend="auto"` (the default) uses obstore when it is importable **and**
+every entry in `storage_options` has an obstore equivalent, and falls back to
+fsspec otherwise, so an option that decides which bytes come back is never
+silently dropped. Reads keep working if obstore is deselected at install time.
+`LAZYBGEN_REMOTE_BACKEND` sets the transport for a whole process;
+`remote_backend="fsspec"` or `"obstore"` pins one reader. The number of threads a
+range batch is split across is `LAZYBGEN_OBSTORE_THREADS` (default 16).
+
+`storage_options` are written the same way for both, in fsspec spelling
+(`anon`, `requester_pays`, `key`, `secret`, `endpoint_url`, ...); the obstore
+transport translates them. Requester-pays works on both: GCS by way of the
+`x-goog-user-project` header, S3 by way of the native request-payer setting.
+
+Measured on a same-region GCS bucket from a `us-central1` VM, reading 500 variants
+(median of 3, both transports verified byte-identical):
+
+| Read | 100k samples (801 MB file) | 500k samples (4.9 GB file) |
+|---|---|---|
+| Region (500 contiguous) | 1081 -> 759 ms (**1.42x**) | 2614 -> 2042 ms (**1.28x**) |
+| Scattered (500 spread)  | 1168 -> 918 ms (**1.27x**) | 2645 -> 1851 ms (**1.43x**) |
+| One variant             | 156 -> 129 ms (**1.21x**)  | 311 -> 255 ms (**1.22x**)  |
+
+The fetch itself is 2.5x (contiguous) to 3.8x (scattered) faster; the end-to-end
+figure is smaller because roughly half of a remote read is decoding and
+allocating the output, which the transport does not touch. `benchmarks/compare_remote_backends.py`
+runs this comparison against your own bucket.
 
 ### Remote `.bgi` index caching
 
@@ -211,13 +259,18 @@ time stays flat while the download baseline grows. At 500k samples:
 | Region (500 contiguous)  | **2.34 s**       | ~4x (10 s)       | ~14x (32 s)     | ~26x (60 s)      |
 | Scattered (200 random)   | **1.26 s**       | ~6x (8 s)        | ~23x (29 s)     | ~46x (58 s)      |
 
-Remote throughput is bounded **per process**, and not by the link. The limit is
-one CPU core's worth of Python-side HTTP and TLS work: every pure-Python transport
-we measured pins at exactly one core and lands within about 15% of the others,
+The numbers above are for the fsspec transport. With **pure-Python** transports,
+remote throughput is bounded per process and not by the link: the limit is one CPU
+core's worth of Python-side HTTP and TLS work, and every pure-Python transport we
+measured pins at exactly one core and lands within about 15% of the others,
 whether it goes through fsspec or straight at aiohttp. Running several event loops
-on several threads is *worse*, not better, since they contend for one GIL. If you
-need more than one process's worth of remote bandwidth, shard the variants across
-**processes**; threads will not do it.
+on several threads is *worse*, not better, since they contend for one GIL.
+
+The default obstore transport lifts that: it does the HTTP and TLS in Rust with
+the GIL released, which takes a byte-range fetch from ~350 MB/s to ~1 GB/s in one
+process and the reads above to 1.2-1.4x (see
+[Remote transports](#remote-transports)). Beyond that, shard the variants across
+**processes**; threads on a pure-Python transport will not do it.
 
 Each cell is the end-to-end speedup, with the download-then-read baseline time in
 parentheses (whole-file `gcloud storage cp` + bgen's local read). Both halves are
