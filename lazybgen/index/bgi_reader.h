@@ -84,7 +84,7 @@ class BgiReader {
      *
      * @return Number of variants
      */
-    size_t get_variant_count() const;
+    size_t get_variant_count();
 
     /**
      * Find variants matching chromosome, position, and allele combinations

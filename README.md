@@ -174,22 +174,28 @@ with BgenReader("chr1.bgen", num_threads=8) as reader:
 ## Performance
 
 lazybgen vs the [`bgen`](https://pypi.org/project/bgen/) package reading the same
-local files (16 vCPU / 125 GB n2 VM, median of 3 page-cache-warm runs, 2026-09-02).
+local files (16 vCPU / 125 GB n2 VM, median of 3 page-cache-warm runs, 2026-09-03).
 Variant count fixed at 10k, samples scaling to biobank size; speedup is lazybgen
 vs bgen, parenthetical is lazybgen's wall time:
 
 | Workload                 | 5k x 10k (94 MB) | 50k x 10k (931 MB) | 500k x 10k (9.1 GB) |
 |--------------------------|------------------|--------------------|---------------------|
-| Full decode              | 3.3x (265 ms)    | 8.3x (980 ms)      | 14.5x (5.36 s)      |
-| Region (500 variants)    | 5.7x (8 ms)      | 6.6x (68 ms)       | 10.4x (417 ms)      |
-| Scattered (200 variants) | 3.3x (7 ms)      | 5.0x (38 ms)       | 6.9x (254 ms)       |
+| Full decode              | 10.6x (75 ms)    | 15.5x (471 ms)     | 15.6x (4.77 s)      |
+| Region (500 variants)    | 7.9x (5 ms)      | 13.3x (30 ms)      | 15.8x (257 ms)      |
+| Scattered (200 variants) | 4.5x (4 ms)      | 10.4x (16 ms)      | 14.4x (114 ms)      |
 
-A local file is memory-mapped and read in place, so a partial read holds only the
-matrix it returns: at 500k samples the region and scattered reads above peak at
-178 MB and 187 MB, against 2.1 GB and 933 MB for the same reads through `bgen`.
-A single-variant lookup is the one workload lazybgen does not win, because it is
-dominated by opening the reader; hold a `BgenReader` open across lookups instead
-of calling `load_bgen` per variant.
+A local file is memory-mapped and read in place, so the compressed bytes are never
+copied into a buffer on the way. What a read costs in memory is then essentially
+the matrix it returns: the 500-variant region above is 1.9 GB of float64 at 500k
+samples, and the read peaks at 2.6 GB, against 2.1 GB for the same read through
+`bgen`. Ask for float32, or fewer samples, if that matters more than precision.
+A single-variant lookup is the one workload lazybgen does not win. Ask for the
+variants together rather than one call each: every call builds a variant-info
+DataFrame, and pandas charges about 100 us for that however few rows it holds, so
+a loop of 500 single-variant calls spends more time in pandas than in reading.
+Passing the positions as one `variant_filter`, or streaming the range with
+`iter_variants`, is ~17x faster for the same 500 variants and is what the
+scattered row above measures.
 
 ### Remote: lazy partial reads at biobank scale
 
@@ -201,15 +207,24 @@ time stays flat while the download baseline grows. At 500k samples:
 
 | Read (500k samples)      | lazybgen `gs://` | 10k var (9.1 GB) | 50k var (45 GB) | 100k var (91 GB) |
 |--------------------------|------------------|------------------|-----------------|------------------|
-| One variant              | **0.50 s**       | ~16x (8 s)       | ~67x (33 s)     | ~172x (85 s)     |
-| Region (500 contiguous)  | **3.9 s**        | ~3x (12 s)       | ~10x (37 s)     | ~23x (89 s)      |
-| Scattered (200 random)   | **1.5 s**        | ~6x (10 s)       | ~23x (35 s)     | ~57x (87 s)      |
+| One variant              | **433 ms**       | ~14x (6 s)       | ~64x (28 s)     | ~130x (56 s)     |
+| Region (500 contiguous)  | **2.34 s**       | ~4x (10 s)       | ~14x (32 s)     | ~26x (60 s)      |
+| Scattered (200 random)   | **1.26 s**       | ~6x (8 s)        | ~23x (29 s)     | ~46x (58 s)      |
+
+Remote throughput is bounded **per process**, and not by the link. The limit is
+one CPU core's worth of Python-side HTTP and TLS work: every pure-Python transport
+we measured pins at exactly one core and lands within about 15% of the others,
+whether it goes through fsspec or straight at aiohttp. Running several event loops
+on several threads is *worse*, not better, since they contend for one GIL. If you
+need more than one process's worth of remote bandwidth, shard the variants across
+**processes**; threads will not do it.
 
 Each cell is the end-to-end speedup, with the download-then-read baseline time in
-parentheses (whole-file `gcloud storage cp` + bgen's local read). lazybgen's
-partial-read times are measured and size-invariant; the download times they are
-compared against are carried forward from an earlier same-region measurement
-(~1.2 GB/s), since they time the transfer rather than either reader. This is
+parentheses (whole-file `gcloud storage cp` + bgen's local read). Both halves are
+measured same-region: the 9.1 GB download ran five times at 8.4 to 10.0 s, median
+6.01 s or 1.62 GB/s, and the larger sizes scale from that rate. Download speed is
+machine-dependent: the same measurement on a smaller VM gave 1.06 GB/s, so treat
+the ratios as being for this class of host. This is
 **best-case for the download** (fast same-region link, free egress), so a
 laptop/cross-region/metered link widens every gap. See
 [benchmarks/README.md](benchmarks/README.md#lazybgen-vs-the-bgen-package) for the

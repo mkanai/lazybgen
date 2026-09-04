@@ -426,6 +426,11 @@ cdef class BgenReader:
             chrom, pos, rsid, ref, alt (access as ``info["chrom"]``) and
             ``dosage`` is a 1-D array of per-sample dosages (NaN for missing),
             length n_samples (after any sample filtering).
+
+            ``dosage`` is a view into the block it was decoded from, not a copy.
+            Its values never change (a block is only ever written once), but
+            holding onto one keeps that whole block alive, so call ``.copy()`` on
+            the ones you keep if you are retaining a subset of a long stream.
         """
         if block_size is not None and block_size < 1:
             raise ValueError("block_size must be a positive integer")
@@ -834,39 +839,48 @@ cdef class BgenReader:
     def _build_variant_info_frame(self, vector[VariantMetadata]& metadata) -> pd.DataFrame:
         """Build the variant-info DataFrame from metadata.
 
-        Builds one Python list per column and constructs the DataFrame from a
-        dict of columns, instead of a per-variant dict fed to
-        ``pd.DataFrame(list_of_dicts)`` (which pandas reassembles into columns
-        with per-row type inference). Same columns, order, and dtypes; cheaper
-        for many variants.
+        Columns are filled as already-typed arrays rather than Python lists:
+        handed lists, pandas re-infers a dtype per column, which costs more than
+        writing the values did. Each entry is read through a pointer, since
+        copying a VariantMetadata per variant would copy three std::strings and
+        the allele vector with it. Same columns, order, and dtypes as before.
         """
         cdef Py_ssize_t n = metadata.size()
         if n == 0:
             return pd.DataFrame()
 
-        chroms = [None] * n
-        positions = [0] * n
-        rsids = [None] * n
-        refs = [None] * n
-        alts = [None] * n
+        chroms = np.empty(n, dtype=object)
+        rsids = np.empty(n, dtype=object)
+        refs = np.empty(n, dtype=object)
+        alts = np.empty(n, dtype=object)
+        positions = np.empty(n, dtype=np.int64)
 
-        cdef VariantMetadata var
+        cdef object[:] chrom_view = chroms
+        cdef object[:] rsid_view = rsids
+        cdef object[:] ref_view = refs
+        cdef object[:] alt_view = alts
+        cdef np.int64_t[:] pos_view = positions
+
+        cdef const VariantMetadata* var
         cdef Py_ssize_t i
         for i in range(n):
-            var = metadata[i]
-            chroms[i] = var.chromosome.decode('utf-8')
-            positions[i] = var.position
-            rsids[i] = var.rsid.decode('utf-8')
-            refs[i] = var.alleles[0].decode('utf-8') if var.alleles.size() > 0 else ''
-            alts[i] = var.alleles[1].decode('utf-8') if var.alleles.size() > 1 else ''
+            var = &metadata[i]
+            chrom_view[i] = var.chromosome.decode('utf-8')
+            pos_view[i] = var.position
+            rsid_view[i] = var.rsid.decode('utf-8')
+            ref_view[i] = var.alleles[0].decode('utf-8') if var.alleles.size() > 0 else ''
+            alt_view[i] = var.alleles[1].decode('utf-8') if var.alleles.size() > 1 else ''
 
-        return pd.DataFrame({
-            'chrom': chroms,
-            'pos': positions,
-            'rsid': rsids,
-            'ref': refs,
-            'alt': alts,
-        })
+        return pd.DataFrame(
+            {
+                'chrom': chroms,
+                'pos': positions,
+                'rsid': rsids,
+                'ref': refs,
+                'alt': alts,
+            },
+            copy=False,
+        )
     
     cdef void _ensure_open(self) except *:
         """Ensure reader is open."""
@@ -957,7 +971,23 @@ cdef class BgenReader:
         Tuple[List[int], List[str]]
             (indices, found_sample_ids)
         """
-        sample_map = {sid: i for i, sid in enumerate(self.samples)}
+        samples = self.samples
+        if len(sample_ids) * 3 <= len(samples):
+            # Small cohort: index only the samples that were asked for. Building
+            # a position for every sample in the file costs far more than the
+            # lookups it serves when a study wants a few thousand of half a
+            # million. Measured on 500k samples, this wins up to about a third of
+            # them and loses beyond that, hence the ratio above; both branches
+            # keep the last position of a repeated ID, as a single dict
+            # comprehension would.
+            wanted = set(sample_ids)
+            sample_map = {}
+            for i, sid in enumerate(samples):
+                if sid in wanted:
+                    sample_map[sid] = i
+        else:
+            sample_map = {sid: i for i, sid in enumerate(samples)}
+
         indices = []
         found_ids = []
         

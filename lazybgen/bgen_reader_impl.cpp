@@ -1,5 +1,9 @@
 #include "bgen_reader_impl.h"
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 #include "format/bgen_header.h"
 #include "format/genotype_parser.h"
 #include "format/variant_parser.h"
@@ -473,7 +477,7 @@ class BgenReaderImpl::Impl {
     // values are still in cache. NaN compares false against everything, so it
     // never moves the bounds; it is picked up by the self-comparison instead.
     template <typename T>
-    static DosageStats scan_dosages(const T* values, size_t n) {
+    static DosageStats scan_dosages_scalar(const T* values, size_t n) {
         double lo = std::numeric_limits<double>::infinity();
         double hi = -std::numeric_limits<double>::infinity();
         bool nan_seen = false;
@@ -489,6 +493,74 @@ class BgenReaderImpl::Impl {
         }
         return DosageStats{lo, hi, nan_seen};
     }
+
+    template <typename T>
+    static DosageStats scan_dosages(const T* values, size_t n) {
+        return scan_dosages_scalar(values, n);
+    }
+
+#if defined(__AVX2__)
+    // The scalar loop above will not auto-vectorize, and cannot be made to:
+    // vminpd returns its second operand when either is NaN, so a NaN would
+    // poison the accumulator, and the compiler will not reorder around that.
+    // std::fmin / std::fmax have the semantics we want but compile to calls and
+    // measure three times slower still. Replacing NaN lanes with the identity
+    // before the vector min/max makes the vector form exact, and it runs 2.6x
+    // faster than the scalar loop on this scan, which is 5-12% of a decode.
+    //
+    // Only the double column is vectorized. It is the default output type and
+    // the one the measurements above are for; a float column is half the bytes,
+    // so it keeps the scalar loop rather than a second copy of this.
+    // A non-template overload, which wins over the template above for an exact
+    // double match. An explicit specialization is not allowed at class scope.
+    static DosageStats scan_dosages(const double* values, size_t n) {
+        const __m256d pos_inf = _mm256_set1_pd(std::numeric_limits<double>::infinity());
+        const __m256d neg_inf = _mm256_set1_pd(-std::numeric_limits<double>::infinity());
+        const __m256d all_ones = _mm256_castsi256_pd(_mm256_set1_epi32(-1));
+        __m256d lo_v = pos_inf;
+        __m256d hi_v = neg_inf;
+        __m256d nan_v = _mm256_setzero_pd();
+
+        size_t k = 0;
+        for (; k + 4 <= n; k += 4) {
+            const __m256d v = _mm256_loadu_pd(values + k);
+            // Lanes that are not NaN compare ordered against themselves.
+            const __m256d ordered = _mm256_cmp_pd(v, v, _CMP_ORD_Q);
+            nan_v = _mm256_or_pd(nan_v, _mm256_andnot_pd(ordered, all_ones));
+            lo_v = _mm256_min_pd(lo_v, _mm256_blendv_pd(pos_inf, v, ordered));
+            hi_v = _mm256_max_pd(hi_v, _mm256_blendv_pd(neg_inf, v, ordered));
+        }
+
+        double lo_lanes[4];
+        double hi_lanes[4];
+        _mm256_storeu_pd(lo_lanes, lo_v);
+        _mm256_storeu_pd(hi_lanes, hi_v);
+        double lo = lo_lanes[0];
+        double hi = hi_lanes[0];
+        for (int lane = 1; lane < 4; ++lane) {
+            if (lo_lanes[lane] < lo) {
+                lo = lo_lanes[lane];
+            }
+            if (hi_lanes[lane] > hi) {
+                hi = hi_lanes[lane];
+            }
+        }
+        bool nan_seen = _mm256_movemask_pd(nan_v) != 0;
+
+        // Tail, and the whole column when it is shorter than one vector.
+        for (; k < n; ++k) {
+            const double v = values[k];
+            nan_seen |= (v != v);
+            if (v < lo) {
+                lo = v;
+            }
+            if (v > hi) {
+                hi = v;
+            }
+        }
+        return DosageStats{lo, hi, nan_seen};
+    }
+#endif  // __AVX2__
 
     // Fold per-variant summaries into one. DosageStats defaults to +inf/-inf,
     // so an entry no worker wrote leaves the combined bounds unchanged instead
@@ -611,7 +683,7 @@ class BgenReaderImpl::Impl {
     template <typename DecodeFn>
     void parallel_inflate_decode(std::vector<CompressedJob>& jobs,
                                  decompress::CompressionType comp_type, size_t num_threads,
-                                 DecodeFn decode) {
+                                 DecodeFn decode, size_t column_bytes = 0) {
         const size_t n_variants = jobs.size();
         if (n_variants == 0) {
             return;
@@ -624,6 +696,31 @@ class BgenReaderImpl::Impl {
             hw = n_variants;
         }
 
+        // Workers claim runs of adjacent variants rather than one at a time.
+        // The output is a fresh column-major matrix whose pages the kernel maps
+        // on first touch. Claiming one variant at a time puts every worker on
+        // adjacent columns at the same moment, so they all first-touch the same
+        // region and serialize in the kernel: page-table locking, made worse by
+        // the transparent huge pages NumPy asks for on large arrays. The decode
+        // then runs no faster than a single-threaded write of its own output.
+        // Giving each worker a run of columns spreads those first touches out.
+        //
+        // The run targets a few megabytes of output. That is tuned, not derived:
+        // throughput is flat between roughly 2 and 8 MB and falls off past about
+        // 16 MB as the tail of the work stops dividing evenly. Runs are capped
+        // so every worker still gets several claims, which bounds how unevenly
+        // the work can land. At biobank sample counts a single column already
+        // exceeds the target, so the run collapses to one variant and this is
+        // exactly the old path. column_bytes == 0 (a caller that does not know
+        // its output geometry) also keeps one-at-a-time claiming.
+        size_t chunk = 1;
+        if (column_bytes > 0) {
+            const size_t run_target_bytes = static_cast<size_t>(4) << 20;
+            const size_t per_run = (run_target_bytes + column_bytes - 1) / column_bytes;
+            const size_t claims_per_worker = n_variants / (hw * 4);
+            chunk = std::max<size_t>(1, std::min(per_run, claims_per_worker));
+        }
+
         std::atomic<size_t> next{0};
         std::atomic<bool> failed{false};
         std::mutex err_mu;
@@ -631,8 +728,10 @@ class BgenReaderImpl::Impl {
 
         auto worker = [&]() {
             std::vector<uint8_t> decomp;
-            size_t i;
-            while ((i = next.fetch_add(1)) < n_variants) {
+            size_t run_start;
+            while ((run_start = next.fetch_add(chunk)) < n_variants) {
+              const size_t run_end = std::min(n_variants, run_start + chunk);
+              for (size_t i = run_start; i < run_end; ++i) {
                 if (failed.load(std::memory_order_relaxed)) {
                     return;
                 }
@@ -671,6 +770,7 @@ class BgenReaderImpl::Impl {
                     }
                     return;
                 }
+              }
             }
         };
 
@@ -719,7 +819,7 @@ class BgenReaderImpl::Impl {
     // decode callback is invoked as decode(i, buf, size, job, layout, n_samples).
     template <typename DecodeStep>
     void read_decode_block_impl(const VariantMetadata* block, size_t n_variants, size_t num_threads,
-                                DecodeStep decode_step) {
+                                DecodeStep decode_step, size_t column_bytes = 0) {
         if (!is_open_) {
             throw std::runtime_error("BGEN file is not open");
         }
@@ -740,7 +840,8 @@ class BgenReaderImpl::Impl {
             jobs, comp_type, num_threads,
             [&](size_t i, const uint8_t* buf, size_t size, const CompressedJob& j) {
                 decode_step(i, buf, size, j, layout, n_samples);
-            });
+            },
+            column_bytes);
     }
 
     template <typename T>
@@ -760,7 +861,8 @@ class BgenReaderImpl::Impl {
                     buf, size, layout, ::lazybgen::bgen::CompressionType::None, n_samples,
                     j.n_alleles, column);
                 per_variant[i] = scan_dosages(column, n_samples);
-            });
+            },
+            out_stride * sizeof(T));
         last_block_stats_ = combine_dosage_stats(per_variant);
     }
 
@@ -783,7 +885,8 @@ class BgenReaderImpl::Impl {
                 filtered_decode_into(column, buf, size, layout, n_samples, j.n_alleles,
                                      sample_indices, n_indices);
                 per_variant[i] = scan_dosages(column, static_cast<size_t>(n_indices));
-            });
+            },
+            out_stride * sizeof(T));
         last_block_stats_ = combine_dosage_stats(per_variant);
     }
 

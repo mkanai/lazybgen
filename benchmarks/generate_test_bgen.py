@@ -199,6 +199,18 @@ def get_test_configurations(mode="standard"):
         {"name": "ukbb_wide", "n_samples": 500000, "n_variants": 5000, "compression": "zlib", "bit_depth": 8},
     ]
 
+    # Fixtures for compare_upscaled.py. Each one answers a question no existing
+    # fixture can: a variant count large enough for the index and metadata cost to
+    # be visible (nothing else exceeds 20k variants), and a matched 8-bit / 16-bit
+    # / zstd triple at a sample count where the decode kernel, not the fixed
+    # per-call cost, dominates.
+    upscale_configs = [
+        {"name": "many_variants", "n_samples": 2000, "n_variants": 500000, "compression": "zlib", "bit_depth": 8},
+        {"name": "enc_8bit", "n_samples": 100000, "n_variants": 2000, "compression": "zlib", "bit_depth": 8},
+        {"name": "enc_16bit", "n_samples": 100000, "n_variants": 2000, "compression": "zlib", "bit_depth": 16},
+        {"name": "enc_zstd", "n_samples": 100000, "n_variants": 2000, "use_zstd": True, "bit_depth": 8},
+    ]
+
     # Select configurations based on mode
     if mode == "quick":
         # Only tiny, small, and medium for quick testing
@@ -215,6 +227,9 @@ def get_test_configurations(mode="standard"):
     elif mode == "large":
         # UKBB-shaped large-sample fixtures
         configs = large_configs
+    elif mode == "upscale":
+        # Fixtures the upscaled benchmark needs beyond the existing set
+        configs = upscale_configs
     elif mode == "comprehensive":
         # Everything
         configs = core_configs + compression_configs + scaling_configs
@@ -231,7 +246,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate test BGEN files for benchmarking")
     parser.add_argument(
         "--mode",
-        choices=["quick", "standard", "comprehensive", "compression", "scaling", "large"],
+        choices=["quick", "standard", "comprehensive", "compression", "scaling", "large", "upscale"],
         default="standard",
         help="Test generation mode",
     )

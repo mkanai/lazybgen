@@ -2,6 +2,7 @@
 
 #include <sqlite3.h>
 
+#include <utility>
 #include <algorithm>
 #include <mutex>
 #include <set>
@@ -98,15 +99,29 @@ class BgiReader::Impl {
         return execute_query(stmt_by_region_);
     }
 
-    size_t get_variant_count() const {
+    size_t get_variant_count() {
+        return variant_count();
+    }
+
+    // Counted on demand and remembered. COUNT(*) is a full scan of the index, so
+    // this is worth avoiding entirely for the many reads that never ask.
+    size_t variant_count() {
+        std::call_once(variant_count_once_, [this]() {
+            sqlite3_stmt* stmt = nullptr;
+            if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM Variant", -1, &stmt, nullptr) !=
+                SQLITE_OK) {
+                throw std::runtime_error("Failed to prepare count query");
+            }
+            StmtFinalizer finalizer(stmt);
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                variant_count_ = static_cast<size_t>(sqlite3_column_int64(stmt, 0));
+            }
+        });
         return variant_count_;
     }
 
     std::vector<VariantInfo> get_all_variants() {
         read_lock lock(mutex_);
-
-        std::vector<VariantInfo> results;
-        results.reserve(variant_count_);
 
         // Query all variants in one go
         const char* query =
@@ -121,9 +136,9 @@ class BgiReader::Impl {
         }
         StmtFinalizer finalizer(stmt);  // finalize on every path (incl. throw)
 
-        results = execute_query(stmt);
-
-        return results;
+        // Worth the extra scan here: this path reads every row anyway, and the
+        // reservation saves re-moving every string as the vector grows.
+        return execute_query(stmt, variant_count());
     }
 
     std::vector<VariantInfo> find_variants_by_filter(const std::string& chromosome,
@@ -277,16 +292,11 @@ class BgiReader::Impl {
             throw std::runtime_error("Invalid BGI file: missing required tables");
         }
 
-        // Get variant count
-        const char* count_query = "SELECT COUNT(*) FROM Variant";
-        if (sqlite3_prepare_v2(db_, count_query, -1, &stmt, nullptr) != SQLITE_OK) {
-            throw std::runtime_error("Failed to prepare count query");
-        }
-
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-            variant_count_ = static_cast<size_t>(sqlite3_column_int64(stmt, 0));
-        }
-        sqlite3_finalize(stmt);
+        // The variant count is deliberately NOT read here: COUNT(*) scans the
+        // whole table, which on a per-chromosome index of a million variants
+        // costs more than everything else about opening the file put together,
+        // and a reader that only asks for regions never needs the number. See
+        // variant_count().
     }
 
     void prepare_statements() {
@@ -303,8 +313,15 @@ class BgiReader::Impl {
         }
     }
 
-    std::vector<VariantInfo> execute_query(sqlite3_stmt* stmt) {
+    // reserve_hint is the caller's expected row count. Growing a vector of
+    // VariantInfo re-moves every string in it at each reallocation, so a whole
+    // index scan is worth sizing up front; an over- or under-estimate is only a
+    // sizing hint and stays correct either way.
+    std::vector<VariantInfo> execute_query(sqlite3_stmt* stmt, size_t reserve_hint = 0) {
         std::vector<VariantInfo> results;
+        if (reserve_hint > 0) {
+            results.reserve(reserve_hint);
+        }
 
         int rc;
         while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
@@ -334,7 +351,7 @@ class BgiReader::Impl {
             if (allele2)
                 info.allele2 = allele2;
 
-            results.push_back(info);
+            results.push_back(std::move(info));
         }
 
         if (rc != SQLITE_DONE) {
@@ -347,6 +364,7 @@ class BgiReader::Impl {
    private:
     sqlite3* db_;
     size_t variant_count_;
+    std::once_flag variant_count_once_;
 
     // Prepared statements
     sqlite3_stmt* stmt_by_region_ = nullptr;
@@ -375,7 +393,7 @@ std::vector<VariantInfo> BgiReader::get_all_variants() {
     return pimpl_->get_all_variants();
 }
 
-size_t BgiReader::get_variant_count() const {
+size_t BgiReader::get_variant_count() {
     return pimpl_->get_variant_count();
 }
 

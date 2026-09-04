@@ -85,3 +85,40 @@ def test_iter_variants_int64_matches(reader):
     assert len(rows_ref) == len(rows_int64)
     for a, b in zip(rows_ref, rows_int64):
         np.testing.assert_array_equal(a, b)
+
+
+def test_get_sample_indices_agrees_across_its_two_strategies(test_bgen_files):
+    """Both cohort-size strategies return the same indices, order and duplicates.
+
+    get_sample_indices indexes only the requested samples when the cohort is
+    small relative to the file, and every sample otherwise. The two must be
+    indistinguishable to a caller.
+    """
+    from lazybgen.reader import BgenReader
+
+    with BgenReader(str(test_bgen_files["basic"])) as reader:
+        samples = reader.samples
+        n = len(samples)
+        assert n > 30
+
+        def reference(requested):
+            """The whole-file strategy, written out."""
+            sample_map = {sid: i for i, sid in enumerate(samples)}
+            idx, found = [], []
+            for sid in requested:
+                if sid in sample_map:
+                    idx.append(sample_map[sid])
+                    found.append(sid)
+            return idx, found
+
+        cases = {
+            "tiny cohort (takes the small-cohort branch)": samples[:3],
+            "whole file (takes the whole-file branch)": list(samples),
+            "out of order": [samples[10], samples[0], samples[5]],
+            "with duplicates": [samples[4], samples[4], samples[1]],
+            "with unknown ids": [samples[2], "NOT_A_SAMPLE", samples[7]],
+            "only unknown ids": ["NOPE_1", "NOPE_2"],
+            "empty": [],
+        }
+        for label, requested in cases.items():
+            assert reader.get_sample_indices(requested) == reference(requested), label
