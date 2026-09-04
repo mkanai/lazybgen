@@ -62,7 +62,7 @@ load_bgen("s3://bucket/file.bgen", storage_options={"anon": True})
 ```
 
 `gs://` reads go through [obstore](https://developmentseed.org/obstore/) by
-default, which is ~1.1-1.5x faster than gcsfs and needs no code change. See
+default, which is 1.1x to 3.5x faster than gcsfs and needs no code change. See
 [Remote transports](#remote-transports).
 
 `load_bgen` returns `(genotypes, variant_info, sample_ids)`, where `genotypes`
@@ -77,7 +77,10 @@ A `.bgi` index is required; create one with `bgenix -g file.bgen`.
 - `index_path`: `.bgi` index (defaults to `file_path + ".bgi"`)
 - `sample_path`: optional `.sample` file
 - `region`: `"chr:start-end"` to read a genomic interval
-- `variant_filter`: variant subset as a dict; build it with
+- `variant_filter`: variant subset as a dict with keys `chromosome`, `positions`,
+  `allele1` and `allele2`, the three lists aligned element by element and the
+  alleles matching the file exactly (see
+  [Reading many variants](#reading-many-variants)); build it with
   `load_variant_filter("variants.z")`, which reads variant IDs/positions from a
   `.z` file (`from lazybgen import load_variant_filter`)
 - `sample_ids`: subset of samples to load
@@ -120,80 +123,75 @@ Layout v1.1 is an older format with a different probability encoding; lazybgen
 decodes it through a separate, less-exercised path, so it is best-effort. Prefer
 v1.2 / v1.3 (re-encode with `qctool2` if needed) for production use.
 
-### Build info
+### Reading many variants
 
-`from lazybgen import get_build_info` returns the compression backend the package
-was built against (vendored libdeflate / zstd, or system libraries).
+Ask for the variants together rather than one call each. Every call returns a
+variant-info DataFrame, and pandas charges about 100 us to build one whatever its
+row count, so a loop of point lookups spends more time in pandas than in reading.
+For 500 variants the batched forms below are ~17x faster than the loop:
 
-### Remote transports
+```python
+from lazybgen import load_bgen
+from lazybgen.reader import BgenReader
 
-Remote reads go through one of two transports, chosen per reader by
-`remote_backend`:
+# Your variants: positions and their alleles, aligned element by element.
+positions = [10_001, 25_500, 91_200]  # ...hundreds more
+ref_alleles = ["A", "C", "G"]
+alt_alleles = ["G", "T", "A"]
 
-- **obstore**, installed by default and used by default **for `gs://`**. It runs
-  HTTP and TLS in Rust with the GIL released, so one process can have many range
-  requests genuinely in flight.
-- **fsspec** (`gcsfs` / `s3fs`), always available, the fallback, and still the
-  default for `s3://`. fsspec drives every request in a process through a single
-  asyncio event loop, which pins one CPU core and caps throughput there.
+# Slow: one call, one DataFrame, per variant.
+for pos in positions:
+    load_bgen("chr1.bgen", region=f"chr1:{pos}-{pos}")
 
-`s3://` stays on s3fs because obstore's S3 store does not resolve a bucket's
-region (it assumes `us-east-1`) and its credential chain does not read
-`~/.aws/credentials`, `AWS_PROFILE` or SSO. Pass `remote_backend="obstore"` to
-use it for S3 anyway, with an explicit region and credentials.
+# Fast: one call for the whole selection.
+genotypes, variant_info, sample_ids = load_bgen(
+    "chr1.bgen",
+    variant_filter={
+        "chromosome": "chr1",
+        "positions": positions,
+        "allele1": ref_alleles,
+        "allele2": alt_alleles,
+    },
+)
 
-**Multiprocessing**: obstore's runtime does not survive `fork()`, which is the
-default start method on Linux. A process that reads and then forks leaves its
-children unable to use obstore, and they fall back to fsspec automatically rather
-than hanging. Use the `spawn` or `forkserver` start method if you want workers to
-keep the faster transport.
+# Also fast, and memory-bounded: stream a contiguous range.
+with BgenReader("chr1.bgen") as reader:
+    for info, dosage in reader.iter_variants(region_chrom="chr1", region_start=10_000, region_end=100_000):
+        ...
+```
 
-`remote_backend="auto"` (the default) uses obstore when it is importable **and**
-every entry in `storage_options` has an obstore equivalent, and falls back to
-fsspec otherwise, so an option that decides which bytes come back is never
-silently dropped. Reads keep working if obstore is deselected at install time.
-`LAZYBGEN_REMOTE_BACKEND` sets the transport for a whole process;
-`remote_backend="fsspec"` or `"obstore"` pins one reader. The number of threads a
-range batch is split across is `LAZYBGEN_OBSTORE_THREADS` (default 16).
+All four keys are required, and the alleles must match the file exactly: a
+variant whose alleles differ is not matched, and neither is one whose `ref`/`alt`
+are the other way round, so a filter that matches nothing raises rather than
+returning an empty result. `load_variant_filter("variants.z")` builds the dict
+from a `.z` file if your variants come from one.
 
-`storage_options` are written the same way for both, in fsspec spelling
-(`anon`, `requester_pays`, `key`, `secret`, `endpoint_url`, ...); the obstore
-transport translates them. Requester-pays works on both: GCS by way of the
-`x-goog-user-project` header, S3 by way of the native request-payer setting.
+### Memory
 
-Measured on a same-region GCS bucket from a `us-central1` VM (fsspec -> obstore,
-same reader, both verified byte-identical):
+A local file is memory-mapped and read in place, so the compressed bytes are
+never copied on the way and a read costs about the matrix it returns. lazybgen
+peaks around 1.2x the `bgen` package for the same read (9.7 GB against 7.8 GB for
+a 2000-variant region at 500k samples).
 
-| Read (500k samples, 9.1 GB file) | fsspec | obstore |
-|---|---|---|
-| Region (500 contiguous) | 2.98 s | **2.79 s** (1.07x) |
-| Scattered (500 spread)  | 1.49 s | **1.26 s** (1.18x) |
-| One variant             | 503 ms | **345 ms** (1.46x) |
-| Full decode             | 53.7 s | **46.1 s** (1.16x) |
+Ask for `float32` when single precision is enough. Dosages are computed in single
+precision either way, so a `float64` result is the exact widening of the same
+numbers, and asking for it costs twice the memory and ~18% more decode time:
 
-The fetch itself is 2.5x (contiguous) to 3.8x (scattered) faster; the end-to-end
-figure is smaller because roughly half of a remote read is decoding and
-allocating the output, which the transport does not touch. The spread across
-workloads and machines is wide (a second run on a smaller file put every read
-between 1.2x and 1.4x, and one scattered read came out slightly below 1.0), so
-treat these as "somewhat faster, never slower in aggregate" rather than a
-constant. `benchmarks/compare_remote_backends.py` runs the comparison against
-your own bucket.
+```python
+import numpy as np
 
-### Remote `.bgi` index caching
+genotypes, _, _ = load_bgen("chr1.bgen", region="chr1:1-1000000", dtype=np.float32)
+```
 
-For a `gs://`/`s3://` BGEN, the genotype data is read in place via byte ranges,
-but the `.bgi` index is downloaded once to a local cache. The cache lives in a
-dedicated directory (a `lazybgen-bgi-cache` subdirectory of the system temp dir)
-and each entry is keyed by a hash of the full URL, so same-named indexes in
-different buckets never collide. Override the location with the
-`LAZYBGEN_BGI_CACHE_DIR` environment variable.
+To avoid materializing the matrix at all, stream it: `iter_variants` is
+`O(n_samples x block_size)` whatever the file holds (see
+[Streaming large files](#streaming-large-files)).
 
 ### Streaming large files
 
 `load_bgen` materializes the whole `(n_samples, n_variants)` matrix. For files
 too large to hold at once, `BgenReader.iter_variants()` streams variants in
-memory-bounded blocks (peak memory `O(n_samples × block_size)`). It yields
+memory-bounded blocks (peak memory `O(n_samples x block_size)`). It yields
 `(info, dosage)` per variant, where `info` is a `dict` with keys
 `chrom, pos, rsid, ref, alt` (access as `info["chrom"]`) and `dosage` is a 1-D
 array of per-sample dosages (NaN for missing):
@@ -235,72 +233,87 @@ with BgenReader("chr1.bgen", num_threads=8) as reader:
     dosages, info = reader.load_variants(region_chrom="chr1", region_start=1, region_end=1_000_000)
 ```
 
+### Remote transports
+
+`gs://` reads go through **obstore**, which does HTTP and TLS in Rust with the GIL
+released, so many range requests are genuinely in flight at once. `s3://` goes
+through **fsspec** (`s3fs`), because obstore's S3 store assumes the `us-east-1`
+region and does not read `~/.aws/credentials`, `AWS_PROFILE` or SSO. Both are
+installed by default and `storage_options` are spelled the same way for either;
+requester-pays works on both.
+
+`remote_backend` overrides the choice per reader (`"auto"`, `"obstore"`,
+`"fsspec"`), and `LAZYBGEN_REMOTE_BACKEND` does it for a process.
+`"auto"` falls back to fsspec whenever obstore is unavailable or cannot express
+one of your `storage_options`, so an option that decides which bytes come back is
+never silently dropped.
+
+Against gcsfs, obstore is worth 1.1x to 3.5x end to end depending on the read:
+most for small ones, which are mostly connection and request latency, and least
+for a full decode, which is bandwidth plus decode.
+
+**Multiprocessing**: obstore's runtime does not survive `fork()`, the default
+start method on Linux. Children of a process that has already read fall back to
+fsspec automatically rather than hanging; use the `spawn` or `forkserver` start
+method to keep the faster transport in workers.
+
+### Remote `.bgi` index caching
+
+For a `gs://`/`s3://` BGEN, the genotype data is read in place via byte ranges,
+but the `.bgi` index is downloaded once to a local cache. The cache lives in a
+dedicated directory (a `lazybgen-bgi-cache` subdirectory of the system temp dir)
+and each entry is keyed by a hash of the full URL, so same-named indexes in
+different buckets never collide. Override the location with the
+`LAZYBGEN_BGI_CACHE_DIR` environment variable.
+
+### Build info
+
+`from lazybgen import get_build_info` returns the compression backend the package
+was built against (vendored libdeflate / zstd, or system libraries).
+
 ## Performance
 
-lazybgen vs the [`bgen`](https://pypi.org/project/bgen/) package reading the same
-local files (16 vCPU / 125 GB n2 VM, median of 3 page-cache-warm runs, 2026-09-04).
-Variant count fixed at 10k, samples scaling to biobank size; speedup is lazybgen
-vs bgen, parenthetical is lazybgen's wall time:
+Against the [`bgen`](https://pypi.org/project/bgen/) package on the same local
+files, 10k variants and samples scaling to biobank size (16 vCPU n2 VM, median of
+3 warm runs, lazybgen's wall time in parentheses):
 
-| Workload                 | 5k x 10k (94 MB) | 50k x 10k (931 MB) | 500k x 10k (9.1 GB) |
-|--------------------------|------------------|--------------------|---------------------|
-| Full decode              | 9.0x (97 ms)     | 14.4x (578 ms)     | 14.4x (5.37 s)      |
-| Region (500 variants)    | 7.1x (6 ms)      | 13.5x (35 ms)      | 13.7x (286 ms)      |
-| Scattered (200 variants) | 4.2x (5 ms)      | 9.4x (21 ms)       | 13.7x (127 ms)      |
-
-A local file is memory-mapped and read in place, so the compressed bytes are never
-copied into a buffer on the way. What a read costs in memory is then essentially
-the matrix it returns: the 500-variant region above is 1.9 GB of float64 at 500k
-samples, and the read peaks at 2.6 GB, against 2.1 GB for the same read through
-`bgen`. Ask for float32, or fewer samples, if that matters more than precision.
-A single-variant lookup is the one workload lazybgen does not win. Ask for the
-variants together rather than one call each: every call builds a variant-info
-DataFrame, and pandas charges about 100 us for that however few rows it holds, so
-a loop of 500 single-variant calls spends more time in pandas than in reading.
-Passing the positions as one `variant_filter`, or streaming the range with
-`iter_variants`, is ~17x faster for the same 500 variants and is what the
-scattered row above measures.
+| Workload                  | 5k samples (94 MB) | 50k (931 MB)   | 500k (9.1 GB)  |
+|---------------------------|--------------------|----------------|----------------|
+| Full decode               | 10.7x (75 ms)      | 15.3x (483 ms) | 15.5x (4.80 s) |
+| Region (2000 variants)    | 8.8x (18 ms)       | 15.3x (99 ms)  | 16.5x (961 ms) |
+| Scattered (1000 variants) | 6.0x (15 ms)       | 13.5x (57 ms)  | 15.5x (501 ms) |
 
 ### Remote: lazy partial reads at biobank scale
 
-A local-only reader must download the whole file before reading a byte; lazybgen
-fetches only the variants you ask for, directly from `gs://`, in time that depends
-on the sample count and the number of variants requested - **not** the file size.
-So as a file grows toward biobank-scale variant counts, lazybgen's partial-read
-time stays flat while the download baseline grows. At 500k samples:
+This is the point of the package. A local-only reader must download the whole file
+before reading a byte, so its cost tracks file size; lazybgen fetches only the
+variants you ask for, so its cost tracks the slice and **does not grow with the
+file**. Each cell is the end-to-end speedup over downloading the file first
+(whole-file `gcloud storage cp` + a local read), with that baseline in
+parentheses:
 
-| Read (500k samples)      | lazybgen `gs://` | 10k var (9.1 GB) | 50k var (45 GB) | 100k var (91 GB) |
-|--------------------------|------------------|------------------|-----------------|------------------|
-| One variant              | **345 ms**       | ~31x (10.6 s)    | ~152x (52 s)    | ~305x (105 s)    |
-| Region (500 contiguous)  | **2.79 s**       | ~4x (10.6 s)     | ~19x (52 s)     | ~38x (105 s)     |
-| Scattered (200 random)   | **1.26 s**       | ~8x (10.6 s)     | ~41x (52 s)     | ~83x (105 s)     |
+| Read (500k samples)       | lazybgen `gs://` | 10k var (9.1 GB) | 50k var (45 GB) | 100k var (91 GB) |
+|---------------------------|------------------|------------------|-----------------|------------------|
+| One variant               | **341 ms**       | ~15x (5.2 s)     | ~76x (26 s)     | ~151x (52 s)     |
+| Region (2000 contiguous)  | **5.93 s**       | 0.9x (5.2 s)     | ~4x (26 s)      | ~9x (52 s)       |
+| Scattered (1000 random)   | **3.12 s**       | ~2x (5.2 s)      | ~8x (26 s)      | ~17x (52 s)      |
 
-The numbers above are for the fsspec transport. With **pure-Python** transports,
-remote throughput is bounded per process and not by the link: the limit is one CPU
-core's worth of Python-side HTTP and TLS work, and every pure-Python transport we
-measured pins at exactly one core and lands within about 15% of the others,
-whether it goes through fsspec or straight at aiohttp. Running several event loops
-on several threads is *worse*, not better, since they contend for one GIL.
+The lazybgen column is one number per row because it does not change with the
+file: the same read costs the same at 10k variants and at 100k. The 0.9x is the
+honest edge of that: at 10k variants a 2000-variant region is a fifth of the file,
+and fetching a fifth of an object costs about what fetching all of it does on a
+fast same-region link. Partial reads pay when the slice is genuinely a slice,
+which is the regime biobank-scale files are in. The baseline is also best-case
+for the download - same-region, free egress, and not very repeatable run to run -
+so a laptop, cross-region or metered link widens every gap.
 
-The default obstore transport lifts that: it does the HTTP and TLS in Rust with
-the GIL released, which takes a byte-range fetch from ~350 MB/s to ~1 GB/s in one
-process. End to end that is worth roughly 1.1-1.5x on the reads above, since about
-half of a remote read is decoding and allocating the output rather than moving
-bytes (see [Remote transports](#remote-transports)). Beyond that, shard the
-variants across **processes**; threads on a pure-Python transport will not do it.
+These are single batched reads. A loop of one-variant calls is ~17x slower for
+the same variants, and a read costs about the matrix it returns; see
+[Reading many variants](#reading-many-variants) and [Memory](#memory).
 
-Each cell is the end-to-end speedup, with the download-then-read baseline time in
-parentheses (whole-file `gcloud storage cp` + bgen's local read). Both halves are
-measured same-region and in the same run: the 9.1 GB download ran five times at
-7.6 / 8.8 / 10.6 / 11.9 / 18.2 s, median 10.6 s or 0.86 GB/s, and the larger sizes
-scale from that rate. Download speed is machine-dependent and not very
-repeatable - the same measurement gave 1.62 GB/s on an identical VM a day earlier
-and 1.06 GB/s on the dev box - so treat the ratios as being for this class of
-host, not as constants. This is
-**best-case for the download** (fast same-region link, free egress), so a
-laptop/cross-region/metered link widens every gap. See
-[benchmarks/README.md](benchmarks/README.md#lazybgen-vs-the-bgen-package) for the
-full size ladder, wall times, invariance check, and methodology.
+[benchmarks/README.md](benchmarks/README.md#lazybgen-vs-the-bgen-package) has the
+full size ladder, remote and transport comparisons, peak-memory tables, and the
+methodology.
 
 ## License
 

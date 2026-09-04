@@ -22,8 +22,9 @@ is unchanged and every read returns byte-identical dosages to 0.1.0.
   in flight at once, where fsspec drives every request in a process through a
   single asyncio event loop that pins one CPU core. The fetch itself is 2.5x
   (contiguous) to 3.8x (scattered) faster than gcsfs, and a full read is
-  roughly 1.1-1.5x, the rest of a remote read being decode and output
-  allocation. It is installed as a dependency and needs no code change.
+  1.1x to 3.5x depending on the read: most for small latency-bound ones, least
+  for a full decode, where the remaining time is decode and output allocation. It
+  is installed as a dependency and needs no code change.
 
   `s3://` keeps using s3fs. obstore's S3 store does not resolve a bucket's region
   and its credential chain skips `~/.aws/credentials`, `AWS_PROFILE` and SSO, so
