@@ -63,6 +63,51 @@ def _counting_gcs_requests():
         GCSFileSystem._cat_file = orig_cat_file
 
 
+@contextlib.contextmanager
+def _counting_gcs_bytes():
+    """Count the bytes a block of code pulls from GCS through gcsfs.
+
+    Hooks the lowest range-fetch coroutine every gcsfs read path reaches. Since
+    gcsfs 2026.10, a file handle reads through a background prefetcher that calls
+    ``GCSFile._async_fetch_range`` and never ``GCSFile._fetch_range``, so a hook
+    on the file handle counts zero; both paths still end in
+    ``GCSFileSystem._cat_file_sequential``. Older gcsfs has no
+    ``_cat_file_sequential`` and routes every read through ``_cat_file``. Counting
+    the returned payload, not ``end - start``, also covers open-ended ranges.
+    Like ``_counting_gcs_requests``, it needs ``remote_backend="fsspec"``.
+
+    fsspec binds each instance's sync wrappers (``cat_file``) to the async
+    methods at construction and caches instances, so a filesystem created
+    before the hook (e.g. the fixture probe's ``fs.info``) would bypass it. The
+    instance cache is cleared on entry, so the reader builds a hooked instance,
+    and on exit, so no hooked instance outlives the block. The exported
+    ``gcsfs.GCSFileSystem`` may be a subclass with its own cache, so both clear.
+    """
+    import gcsfs
+    from gcsfs.core import GCSFileSystem
+
+    def clear_caches():
+        for cls in {GCSFileSystem, gcsfs.GCSFileSystem}:
+            cls.clear_instance_cache()
+
+    name = "_cat_file_sequential" if hasattr(GCSFileSystem, "_cat_file_sequential") else "_cat_file"
+    orig = getattr(GCSFileSystem, name)
+    fetched = {"bytes": 0}
+
+    async def counting(self, path, start=None, end=None, **kwargs):
+        data = await orig(self, path, start=start, end=end, **kwargs)
+        fetched["bytes"] += len(data)
+        return data
+
+    clear_caches()
+    setattr(GCSFileSystem, name, counting)
+    try:
+        yield fetched
+    finally:
+        setattr(GCSFileSystem, name, orig)
+        clear_caches()
+
+
 @pytest.mark.integration
 class TestGCSIntegration:
     """Integration tests requiring actual GCS access.
@@ -139,7 +184,6 @@ class TestGCSIntegration:
         Skips if the fixture is unreachable.
         """
         import gcsfs
-        from gcsfs.core import GCSFile
 
         fs = gcsfs.GCSFileSystem()
         try:
@@ -148,17 +192,9 @@ class TestGCSIntegration:
             pytest.skip(f"large fixture unavailable: {exc}")
         assert file_size > 16 * 1024 * 1024  # must exceed the max block to be a real guard
 
-        # Count bytes pulled from GCS. fsspec binds a file's range fetcher at
-        # OPEN time, so the wrapper must be installed BEFORE the reader opens.
-        fetched = {"bytes": 0}
-        orig = GCSFile._fetch_range
-
-        def counting_fetch_range(self, start, end):
-            fetched["bytes"] += end - start
-            return orig(self, start, end)
-
-        GCSFile._fetch_range = counting_fetch_range
-        try:
+        # Install the byte counter BEFORE the reader opens, so every range fetch
+        # the open sets up is counted.
+        with _counting_gcs_bytes() as fetched:
             reader = BgenReader(GCS_LARGE_BGEN, bgi_path=GCS_LARGE_BGEN + ".bgi", remote_backend="fsspec")
             # Measure only the genotype read path, not the one-time header/sample
             # parse done at open (which fills the larger sequential buffer).
@@ -166,8 +202,6 @@ class TestGCSIntegration:
             # block_size=1 routes one variant through the small-block path.
             for _info, _dosage in reader.iter_variants(block_size=1):
                 break
-        finally:
-            GCSFile._fetch_range = orig
 
         # One variant's record for this fixture is well under 1 MB; allow slack
         # for the readahead block + metadata window, but stay far below the
@@ -186,7 +220,6 @@ class TestGCSIntegration:
         which is paid on every open. Skips if the fixture is unreachable.
         """
         import gcsfs
-        from gcsfs.core import GCSFile
 
         fs = gcsfs.GCSFileSystem()
         try:
@@ -194,18 +227,8 @@ class TestGCSIntegration:
         except Exception as exc:  # noqa: BLE001 - environment/fixture issue -> skip
             pytest.skip(f"large fixture unavailable: {exc}")
 
-        fetched = {"bytes": 0}
-        orig = GCSFile._fetch_range
-
-        def counting_fetch_range(self, start, end):
-            fetched["bytes"] += end - start
-            return orig(self, start, end)
-
-        GCSFile._fetch_range = counting_fetch_range
-        try:
+        with _counting_gcs_bytes() as fetched:
             BgenReader(GCS_LARGE_BGEN, bgi_path=GCS_LARGE_BGEN + ".bgi", remote_backend="fsspec")
-        finally:
-            GCSFile._fetch_range = orig
 
         # The header + sample block for this fixture are well under 4 MB; the
         # pre-fix 10 MB buffer fetched ~11 MB.
