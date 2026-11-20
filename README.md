@@ -254,9 +254,12 @@ most for small ones, which are mostly connection and request latency, and least
 for a full decode, which is bandwidth plus decode.
 
 **Multiprocessing**: obstore's runtime does not survive `fork()`, the default
-start method on Linux. Children of a process that has already read fall back to
-fsspec automatically rather than hanging; use the `spawn` or `forkserver` start
-method to keep the faster transport in workers.
+start method on Linux before Python 3.14. Children of a process that has already
+read fall back to fsspec automatically rather than hanging; use the `spawn` or
+`forkserver` start method to keep the faster transport in workers. Forked
+children also read `gs://` through gcsfs's core (HTTP-only) filesystem, because
+gcsfs's default one can hang after `fork()`, so they cannot read zonal ("Rapid")
+buckets; `spawn` and `forkserver` workers can.
 
 ### Remote `.bgi` index caching
 

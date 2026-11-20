@@ -5,6 +5,33 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-11-20
+
+A bug-fix release for gcsfs 2026.10 and later. Reads in processes that never
+fork are unchanged.
+
+### Fixed
+
+- **Forked workers no longer hang on `gs://` reads.** Since gcsfs 2026.10, the
+  filesystem gcsfs exports looks up each bucket's type over gRPC whenever
+  credentials are available, and in a child forked after the parent read
+  remotely that lookup hangs or crashes. It broke the fsspec fallback that
+  forked children rely on, so a `multiprocessing` pool using the `fork` start
+  method could stall with no error on a GCE VM or any machine with
+  application-default credentials. Every forked child now reads `gs://` through
+  gcsfs's core (HTTP-only) filesystem. A filesystem class you registered for
+  `gs` yourself is left alone.
+
+### Changed
+
+- **Forked children cannot read zonal ("Rapid") GCS buckets**, which need gRPC.
+  Standard buckets are unaffected, as are `spawn` and `forkserver` workers and
+  single-process use. Most forked readers of a zonal bucket hung before this
+  release anyway; the exception is a child whose parent had not yet read
+  remotely, which could read one before.
+
+Tested with gcsfs 2026.10.1 and 2025.7.0.
+
 ## [0.2.0] - 2026-09-04
 
 A performance release, plus a faster default transport for `gs://` reads. Every
@@ -94,5 +121,6 @@ byte-range reads. It was extracted from
   (manylinux/musllinux x86_64, macOS arm64). `get_build_info()` reports the
   compression backend the package was built against.
 
+[0.2.1]: https://github.com/mkanai/lazybgen/releases/tag/v0.2.1
 [0.2.0]: https://github.com/mkanai/lazybgen/releases/tag/v0.2.0
 [0.1.0]: https://github.com/mkanai/lazybgen/releases/tag/v0.1.0
