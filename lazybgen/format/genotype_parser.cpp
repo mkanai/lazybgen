@@ -4,6 +4,7 @@
 #include <stdexcept>
 
 #include "genotype_parser_simd.h"
+#include "simd_target.h"
 
 namespace lazybgen {
 namespace bgen {
@@ -164,6 +165,26 @@ void GenotypeParser::compute_dosages_v11_direct(const uint8_t* buffer, size_t si
 template <typename T>
 void GenotypeParser::compute_dosages_v12_direct(const uint8_t* buffer, size_t size, uint32_t n_samples,
                                              uint16_t n_alleles, T* output) {
+#ifdef LAZYBGEN_X86_AVX2
+    if (cpu_has_avx2()) {
+        compute_dosages_v12_direct_avx2<T>(buffer, size, n_samples, n_alleles, output);
+        return;
+    }
+#endif
+    compute_dosages_v12_direct_body<T>(buffer, size, n_samples, n_alleles, output);
+}
+
+#ifdef LAZYBGEN_X86_AVX2
+template <typename T>
+LAZYBGEN_TARGET_AVX2 void GenotypeParser::compute_dosages_v12_direct_avx2(
+    const uint8_t* buffer, size_t size, uint32_t n_samples, uint16_t n_alleles, T* output) {
+    compute_dosages_v12_direct_body<T>(buffer, size, n_samples, n_alleles, output);
+}
+#endif
+
+template <typename T>
+LAZYBGEN_ALWAYS_INLINE void GenotypeParser::compute_dosages_v12_direct_body(
+    const uint8_t* buffer, size_t size, uint32_t n_samples, uint16_t n_alleles, T* output) {
     if (n_alleles != 2) {
         throw std::runtime_error("Direct dosage computation only supported for biallelic variants");
     }

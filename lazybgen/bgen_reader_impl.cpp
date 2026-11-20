@@ -1,11 +1,8 @@
 #include "bgen_reader_impl.h"
 
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include "format/simd_target.h"
+#if defined(LAZYBGEN_X86_AVX2)
 #include <immintrin.h>
-// Baseline x86-64 build: only scan_dosages_avx2 below uses AVX2, behind a
-// runtime check (see genotype_parser_simd.cpp).
-#define LAZYBGEN_X86_AVX2 1
-#define LAZYBGEN_TARGET_AVX2 __attribute__((target("avx2")))
 #endif
 
 #include "format/bgen_header.h"

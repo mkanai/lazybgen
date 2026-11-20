@@ -13,15 +13,7 @@
 #include <arm_neon.h>
 #endif
 
-// The extension is compiled for baseline x86-64, so it imports and runs on CPUs
-// without AVX2. Only the kernels marked LAZYBGEN_TARGET_AVX2 contain AVX2/FMA
-// instructions, and they run only after detect_cpu_features() has confirmed
-// both. Compiling the whole extension with -mavx2 instead let the compiler emit
-// AVX2 anywhere, which killed the interpreter at import on older CPUs.
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-#define LAZYBGEN_X86_AVX2 1
-#define LAZYBGEN_TARGET_AVX2 __attribute__((target("avx2,fma")))
-#endif
+#include "simd_target.h"
 
 namespace lazybgen {
 namespace bgen {

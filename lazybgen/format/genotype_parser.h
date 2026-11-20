@@ -176,10 +176,19 @@ class GenotypeParser {
     static void compute_dosages_v11_typed(const uint8_t* buffer, size_t size, uint32_t n_samples,
                                 double* output);
 
-    // Direct dosage computation for v1.2 (scalar; templated on output precision)
+    // Direct dosage computation for v1.2 (scalar; templated on output precision).
+    // Dispatches at runtime to the same body compiled with or without AVX2/FMA
+    // (see simd_target.h): the scalar loop runs measurably faster with VEX
+    // encoding, and the AVX2 build keeps results identical to earlier releases.
     template <typename T>
     static void compute_dosages_v12_direct(const uint8_t* buffer, size_t size, uint32_t n_samples,
                                         uint16_t n_alleles, T* output);
+    template <typename T>
+    static void compute_dosages_v12_direct_body(const uint8_t* buffer, size_t size,
+                                             uint32_t n_samples, uint16_t n_alleles, T* output);
+    template <typename T>
+    static void compute_dosages_v12_direct_avx2(const uint8_t* buffer, size_t size,
+                                             uint32_t n_samples, uint16_t n_alleles, T* output);
 
     // Optimized filtered dosage computation for v1.2
     static void compute_dosages_v12_filtered(const uint8_t* buffer, size_t size, uint32_t n_samples,
