@@ -13,6 +13,16 @@
 #include <arm_neon.h>
 #endif
 
+// The extension is compiled for baseline x86-64, so it imports and runs on CPUs
+// without AVX2. Only the kernels marked LAZYBGEN_TARGET_AVX2 contain AVX2/FMA
+// instructions, and they run only after detect_cpu_features() has confirmed
+// both. Compiling the whole extension with -mavx2 instead let the compiler emit
+// AVX2 anywhere, which killed the interpreter at import on older CPUs.
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define LAZYBGEN_X86_AVX2 1
+#define LAZYBGEN_TARGET_AVX2 __attribute__((target("avx2,fma")))
+#endif
+
 namespace lazybgen {
 namespace bgen {
 
@@ -26,9 +36,10 @@ static bool g_has_neon = false;
 static void detect_cpu_features() {
     std::call_once(g_simd_once, []() {
 #ifdef __x86_64__
-        // Check for AVX2 support
+        // The AVX2 kernels also use FMA, so require both. Every AVX2 CPU has
+        // FMA, but a hypervisor can mask one without the other.
         __builtin_cpu_init();
-        g_has_avx2 = __builtin_cpu_supports("avx2");
+        g_has_avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
 #elif defined(__aarch64__)
         // ARM NEON is always available on AArch64
         g_has_neon = true;
@@ -39,6 +50,11 @@ static void detect_cpu_features() {
 bool can_use_simd_dosage() {
     detect_cpu_features();
     return g_has_avx2 || g_has_neon;
+}
+
+bool cpu_has_avx2() {
+    detect_cpu_features();
+    return g_has_avx2;
 }
 
 namespace simd {
@@ -84,68 +100,78 @@ void compute_dosages_filtered_simd(const uint8_t* prob_data, float* output,
 }
 
 // Helper functions for filtered computation
+#ifdef LAZYBGEN_X86_AVX2
+// AVX2 part of the kernel below; returns the index the scalar tail resumes from.
+LAZYBGEN_TARGET_AVX2 static size_t filtered_8bit_avx2(const uint8_t* prob_data, float* output,
+                                               const int* sample_indices, size_t n_indices,
+                                               const uint8_t* missing_mask, size_t i) {
+    // Process 8 samples at a time with AVX2
+    const __m256 scale = _mm256_set1_ps(1.0f / 255.0f);
+    const __m256 two = _mm256_set1_ps(2.0f);
+
+    for (; i + 7 < n_indices; i += 8) {
+        // Gather data for 8 selected samples
+        uint8_t prob_aa[8], prob_ab[8];
+        bool is_missing[8] = {false};
+
+        for (int j = 0; j < 8; ++j) {
+            int idx = sample_indices[i + j];
+            prob_aa[j] = prob_data[idx * 2];
+            prob_ab[j] = prob_data[idx * 2 + 1];
+
+            if (missing_mask) {
+                // BGEN v1.2/v1.3: one byte per sample, high bit 0x80 = missing.
+                is_missing[j] = (missing_mask[idx] & 0x80) != 0;
+            }
+        }
+
+        // Pack into vectors
+        __m256i prob_aa_vec = _mm256_set_epi32(prob_aa[7], prob_aa[6], prob_aa[5], prob_aa[4],
+                                               prob_aa[3], prob_aa[2], prob_aa[1], prob_aa[0]);
+
+        __m256i prob_ab_vec = _mm256_set_epi32(prob_ab[7], prob_ab[6], prob_ab[5], prob_ab[4],
+                                               prob_ab[3], prob_ab[2], prob_ab[1], prob_ab[0]);
+
+        // Calculate P(BB) = 255 - P(AA) - P(AB)
+        __m256i sum = _mm256_add_epi32(prob_aa_vec, prob_ab_vec);
+        __m256i max_val = _mm256_set1_epi32(255);
+        __m256i prob_bb = _mm256_sub_epi32(max_val, sum);
+
+        // Convert to float and calculate dosage
+        __m256 prob_ab_f = _mm256_cvtepi32_ps(prob_ab_vec);
+        __m256 prob_bb_f = _mm256_cvtepi32_ps(prob_bb);
+        __m256 dosage = _mm256_mul_ps(_mm256_fmadd_ps(two, prob_bb_f, prob_ab_f), scale);
+
+        float result[8];
+        _mm256_storeu_ps(result, dosage);
+
+        // Per-lane fixup, matching the scalar / 16-bit / 32-bit / NEON
+        // contract: missing samples decode to NaN, and an invalid
+        // probability sum (prob_aa + prob_ab > 255) also decodes to NaN
+        // (the vector chunk above computed prob_bb = 255 - sum, which goes
+        // negative for such corrupt input). Using a scalar store here also
+        // avoids the _mm256_blendv_ps sign-bit pitfall: nanf("") has its
+        // sign bit clear, so blendv would keep the computed dosage.
+        for (int j = 0; j < 8; ++j) {
+            if (is_missing[j] || (static_cast<int>(prob_aa[j]) + prob_ab[j] > 255)) {
+                output[i + j] = std::nanf("");
+            } else {
+                output[i + j] = result[j];
+            }
+        }
+    }
+    return i;
+}
+#endif
+
 static void compute_dosages_filtered_8bit_simd(const uint8_t* prob_data, float* output,
                                                const int* sample_indices, size_t n_indices,
                                                const uint8_t* missing_mask) {
     size_t i = 0;
 
-#ifdef __x86_64__
+#ifdef LAZYBGEN_X86_AVX2
     if (g_has_avx2) {
-        // Process 8 samples at a time with AVX2
-        const __m256 scale = _mm256_set1_ps(1.0f / 255.0f);
-        const __m256 two = _mm256_set1_ps(2.0f);
-
-        for (; i + 7 < n_indices; i += 8) {
-            // Gather data for 8 selected samples
-            uint8_t prob_aa[8], prob_ab[8];
-            bool is_missing[8] = {false};
-
-            for (int j = 0; j < 8; ++j) {
-                int idx = sample_indices[i + j];
-                prob_aa[j] = prob_data[idx * 2];
-                prob_ab[j] = prob_data[idx * 2 + 1];
-
-                if (missing_mask) {
-                    // BGEN v1.2/v1.3: one byte per sample, high bit 0x80 = missing.
-                    is_missing[j] = (missing_mask[idx] & 0x80) != 0;
-                }
-            }
-
-            // Pack into vectors
-            __m256i prob_aa_vec = _mm256_set_epi32(prob_aa[7], prob_aa[6], prob_aa[5], prob_aa[4],
-                                                   prob_aa[3], prob_aa[2], prob_aa[1], prob_aa[0]);
-
-            __m256i prob_ab_vec = _mm256_set_epi32(prob_ab[7], prob_ab[6], prob_ab[5], prob_ab[4],
-                                                   prob_ab[3], prob_ab[2], prob_ab[1], prob_ab[0]);
-
-            // Calculate P(BB) = 255 - P(AA) - P(AB)
-            __m256i sum = _mm256_add_epi32(prob_aa_vec, prob_ab_vec);
-            __m256i max_val = _mm256_set1_epi32(255);
-            __m256i prob_bb = _mm256_sub_epi32(max_val, sum);
-
-            // Convert to float and calculate dosage
-            __m256 prob_ab_f = _mm256_cvtepi32_ps(prob_ab_vec);
-            __m256 prob_bb_f = _mm256_cvtepi32_ps(prob_bb);
-            __m256 dosage = _mm256_mul_ps(_mm256_fmadd_ps(two, prob_bb_f, prob_ab_f), scale);
-
-            float result[8];
-            _mm256_storeu_ps(result, dosage);
-
-            // Per-lane fixup, matching the scalar / 16-bit / 32-bit / NEON
-            // contract: missing samples decode to NaN, and an invalid
-            // probability sum (prob_aa + prob_ab > 255) also decodes to NaN
-            // (the vector chunk above computed prob_bb = 255 - sum, which goes
-            // negative for such corrupt input). Using a scalar store here also
-            // avoids the _mm256_blendv_ps sign-bit pitfall: nanf("") has its
-            // sign bit clear, so blendv would keep the computed dosage.
-            for (int j = 0; j < 8; ++j) {
-                if (is_missing[j] || (static_cast<int>(prob_aa[j]) + prob_ab[j] > 255)) {
-                    output[i + j] = std::nanf("");
-                } else {
-                    output[i + j] = result[j];
-                }
-            }
-        }
+        i = filtered_8bit_avx2(prob_data, output, sample_indices, n_indices, missing_mask, i);
     }
 #elif defined(__aarch64__)
     if (g_has_neon) {
@@ -222,60 +248,70 @@ static void compute_dosages_filtered_8bit_simd(const uint8_t* prob_data, float* 
     }
 }
 
+#ifdef LAZYBGEN_X86_AVX2
+// AVX2 part of the kernel below; returns the index the scalar tail resumes from.
+LAZYBGEN_TARGET_AVX2 static size_t filtered_16bit_avx2(const uint8_t* prob_data, float* output,
+                                               const int* sample_indices, size_t n_indices,
+                                               const uint8_t* missing_mask, size_t i) {
+    // Process 8 samples at a time with AVX2
+    const __m256 scale = _mm256_set1_ps(1.0f / 65535.0f);
+    const __m256 two = _mm256_set1_ps(2.0f);
+
+    for (; i + 7 < n_indices; i += 8) {
+        // Gather data for 8 selected samples
+        uint32_t prob_aa_arr[8], prob_ab_arr[8];
+        for (int j = 0; j < 8; ++j) {
+            int idx = sample_indices[i + j];
+            prob_aa_arr[j] = read_le16(prob_data + idx * 4);
+            prob_ab_arr[j] = read_le16(prob_data + idx * 4 + 2);
+        }
+
+        __m256i prob_aa =
+            _mm256_set_epi32(prob_aa_arr[7], prob_aa_arr[6], prob_aa_arr[5], prob_aa_arr[4],
+                             prob_aa_arr[3], prob_aa_arr[2], prob_aa_arr[1], prob_aa_arr[0]);
+
+        __m256i prob_ab =
+            _mm256_set_epi32(prob_ab_arr[7], prob_ab_arr[6], prob_ab_arr[5], prob_ab_arr[4],
+                             prob_ab_arr[3], prob_ab_arr[2], prob_ab_arr[1], prob_ab_arr[0]);
+
+        // Calculate P(BB) = 65535 - P(AA) - P(AB)
+        __m256i sum = _mm256_add_epi32(prob_aa, prob_ab);
+        __m256i max_val = _mm256_set1_epi32(65535);
+        __m256i prob_bb = _mm256_sub_epi32(max_val, sum);
+
+        // Convert to float and calculate dosage
+        __m256 prob_ab_f = _mm256_cvtepi32_ps(prob_ab);
+        __m256 prob_bb_f = _mm256_cvtepi32_ps(prob_bb);
+        __m256 dosage = _mm256_mul_ps(_mm256_fmadd_ps(two, prob_bb_f, prob_ab_f), scale);
+
+        float result[8];
+        _mm256_storeu_ps(result, dosage);
+
+        // Per-lane fixup matching the scalar contract: missing samples and
+        // an invalid probability sum (prob_aa + prob_ab > 65535) decode to
+        // NaN.
+        for (int j = 0; j < 8; ++j) {
+            int idx = sample_indices[i + j];
+            bool is_missing = missing_mask && (missing_mask[idx] & 0x80) != 0;
+            if (is_missing || (prob_aa_arr[j] + prob_ab_arr[j] > 65535)) {
+                output[i + j] = std::nanf("");
+            } else {
+                output[i + j] = result[j];
+            }
+        }
+    }
+    return i;
+}
+#endif
+
 static void compute_dosages_filtered_16bit_simd(const uint8_t* prob_data, float* output,
                                                 const int* sample_indices, size_t n_indices,
                                                 const uint8_t* missing_mask) {
     size_t i = 0;
 
-#ifdef __x86_64__
+#ifdef LAZYBGEN_X86_AVX2
     if (g_has_avx2) {
-        // Process 8 samples at a time with AVX2
-        const __m256 scale = _mm256_set1_ps(1.0f / 65535.0f);
-        const __m256 two = _mm256_set1_ps(2.0f);
-
-        for (; i + 7 < n_indices; i += 8) {
-            // Gather data for 8 selected samples
-            uint32_t prob_aa_arr[8], prob_ab_arr[8];
-            for (int j = 0; j < 8; ++j) {
-                int idx = sample_indices[i + j];
-                prob_aa_arr[j] = read_le16(prob_data + idx * 4);
-                prob_ab_arr[j] = read_le16(prob_data + idx * 4 + 2);
-            }
-
-            __m256i prob_aa =
-                _mm256_set_epi32(prob_aa_arr[7], prob_aa_arr[6], prob_aa_arr[5], prob_aa_arr[4],
-                                 prob_aa_arr[3], prob_aa_arr[2], prob_aa_arr[1], prob_aa_arr[0]);
-
-            __m256i prob_ab =
-                _mm256_set_epi32(prob_ab_arr[7], prob_ab_arr[6], prob_ab_arr[5], prob_ab_arr[4],
-                                 prob_ab_arr[3], prob_ab_arr[2], prob_ab_arr[1], prob_ab_arr[0]);
-
-            // Calculate P(BB) = 65535 - P(AA) - P(AB)
-            __m256i sum = _mm256_add_epi32(prob_aa, prob_ab);
-            __m256i max_val = _mm256_set1_epi32(65535);
-            __m256i prob_bb = _mm256_sub_epi32(max_val, sum);
-
-            // Convert to float and calculate dosage
-            __m256 prob_ab_f = _mm256_cvtepi32_ps(prob_ab);
-            __m256 prob_bb_f = _mm256_cvtepi32_ps(prob_bb);
-            __m256 dosage = _mm256_mul_ps(_mm256_fmadd_ps(two, prob_bb_f, prob_ab_f), scale);
-
-            float result[8];
-            _mm256_storeu_ps(result, dosage);
-
-            // Per-lane fixup matching the scalar contract: missing samples and
-            // an invalid probability sum (prob_aa + prob_ab > 65535) decode to
-            // NaN.
-            for (int j = 0; j < 8; ++j) {
-                int idx = sample_indices[i + j];
-                bool is_missing = missing_mask && (missing_mask[idx] & 0x80) != 0;
-                if (is_missing || (prob_aa_arr[j] + prob_ab_arr[j] > 65535)) {
-                    output[i + j] = std::nanf("");
-                } else {
-                    output[i + j] = result[j];
-                }
-            }
-        }
+        i = filtered_16bit_avx2(prob_data, output, sample_indices, n_indices, missing_mask, i);
     }
 #elif defined(__aarch64__)
     if (g_has_neon) {
@@ -427,58 +463,67 @@ static void compute_dosages_filtered_32bit_simd(const uint8_t* prob_data, float*
 }
 
 // BGEN v1.1 SIMD implementation
+#ifdef LAZYBGEN_X86_AVX2
+// AVX2 part of the kernel below; returns the index the scalar tail resumes from.
+LAZYBGEN_TARGET_AVX2 static size_t v11_avx2(const uint8_t* buffer, size_t n_samples, float* output,
+                                            size_t i) {
+    // Process 8 samples at a time with AVX2
+    const __m256 two = _mm256_set1_ps(2.0f);
+
+    for (; i + 7 < n_samples; i += 8) {
+        // Load 48 bytes (8 samples × 6 bytes)
+        // Each sample has 3 uint16_t values: prob_aa, prob_ab, prob_bb
+
+        // Gather P(AA) and P(AB) values for 8 samples
+        __m256i prob_aa =
+            _mm256_set_epi32(read_le16(buffer + (i + 7) * 6), read_le16(buffer + (i + 6) * 6),
+                             read_le16(buffer + (i + 5) * 6), read_le16(buffer + (i + 4) * 6),
+                             read_le16(buffer + (i + 3) * 6), read_le16(buffer + (i + 2) * 6),
+                             read_le16(buffer + (i + 1) * 6), read_le16(buffer + (i + 0) * 6));
+
+        __m256i prob_ab = _mm256_set_epi32(
+            read_le16(buffer + (i + 7) * 6 + 2), read_le16(buffer + (i + 6) * 6 + 2),
+            read_le16(buffer + (i + 5) * 6 + 2), read_le16(buffer + (i + 4) * 6 + 2),
+            read_le16(buffer + (i + 3) * 6 + 2), read_le16(buffer + (i + 2) * 6 + 2),
+            read_le16(buffer + (i + 1) * 6 + 2), read_le16(buffer + (i + 0) * 6 + 2));
+
+        __m256i prob_bb = _mm256_set_epi32(
+            read_le16(buffer + (i + 7) * 6 + 4), read_le16(buffer + (i + 6) * 6 + 4),
+            read_le16(buffer + (i + 5) * 6 + 4), read_le16(buffer + (i + 4) * 6 + 4),
+            read_le16(buffer + (i + 3) * 6 + 4), read_le16(buffer + (i + 2) * 6 + 4),
+            read_le16(buffer + (i + 1) * 6 + 4), read_le16(buffer + (i + 0) * 6 + 4));
+
+        // Check for missing data (all probabilities == 0)
+        __m256i sum_check = _mm256_or_si256(_mm256_or_si256(prob_aa, prob_ab), prob_bb);
+        __m256i is_missing_mask = _mm256_cmpeq_epi32(sum_check, _mm256_setzero_si256());
+
+        // Calculate sum for normalization
+        __m256i sum = _mm256_add_epi32(_mm256_add_epi32(prob_aa, prob_ab), prob_bb);
+
+        // Convert to float for division
+        __m256 sum_f = _mm256_cvtepi32_ps(sum);
+        __m256 prob_ab_f = _mm256_cvtepi32_ps(prob_ab);
+        __m256 prob_bb_f = _mm256_cvtepi32_ps(prob_bb);
+
+        // Calculate dosage = (prob_ab + 2 * prob_bb) / sum
+        __m256 dosage = _mm256_div_ps(_mm256_fmadd_ps(two, prob_bb_f, prob_ab_f), sum_f);
+
+        // Create NaN mask for missing values
+        __m256 nan_val = _mm256_set1_ps(std::nanf(""));
+        dosage = _mm256_blendv_ps(dosage, nan_val, _mm256_castsi256_ps(is_missing_mask));
+
+        _mm256_storeu_ps(output + i, dosage);
+    }
+    return i;
+}
+#endif
+
 void compute_dosages_v11_simd(const uint8_t* buffer, size_t n_samples, float* output) {
     size_t i = 0;
 
-#ifdef __x86_64__
+#ifdef LAZYBGEN_X86_AVX2
     if (g_has_avx2) {
-        // Process 8 samples at a time with AVX2
-        const __m256 two = _mm256_set1_ps(2.0f);
-
-        for (; i + 7 < n_samples; i += 8) {
-            // Load 48 bytes (8 samples × 6 bytes)
-            // Each sample has 3 uint16_t values: prob_aa, prob_ab, prob_bb
-
-            // Gather P(AA) and P(AB) values for 8 samples
-            __m256i prob_aa =
-                _mm256_set_epi32(read_le16(buffer + (i + 7) * 6), read_le16(buffer + (i + 6) * 6),
-                                 read_le16(buffer + (i + 5) * 6), read_le16(buffer + (i + 4) * 6),
-                                 read_le16(buffer + (i + 3) * 6), read_le16(buffer + (i + 2) * 6),
-                                 read_le16(buffer + (i + 1) * 6), read_le16(buffer + (i + 0) * 6));
-
-            __m256i prob_ab = _mm256_set_epi32(
-                read_le16(buffer + (i + 7) * 6 + 2), read_le16(buffer + (i + 6) * 6 + 2),
-                read_le16(buffer + (i + 5) * 6 + 2), read_le16(buffer + (i + 4) * 6 + 2),
-                read_le16(buffer + (i + 3) * 6 + 2), read_le16(buffer + (i + 2) * 6 + 2),
-                read_le16(buffer + (i + 1) * 6 + 2), read_le16(buffer + (i + 0) * 6 + 2));
-
-            __m256i prob_bb = _mm256_set_epi32(
-                read_le16(buffer + (i + 7) * 6 + 4), read_le16(buffer + (i + 6) * 6 + 4),
-                read_le16(buffer + (i + 5) * 6 + 4), read_le16(buffer + (i + 4) * 6 + 4),
-                read_le16(buffer + (i + 3) * 6 + 4), read_le16(buffer + (i + 2) * 6 + 4),
-                read_le16(buffer + (i + 1) * 6 + 4), read_le16(buffer + (i + 0) * 6 + 4));
-
-            // Check for missing data (all probabilities == 0)
-            __m256i sum_check = _mm256_or_si256(_mm256_or_si256(prob_aa, prob_ab), prob_bb);
-            __m256i is_missing_mask = _mm256_cmpeq_epi32(sum_check, _mm256_setzero_si256());
-
-            // Calculate sum for normalization
-            __m256i sum = _mm256_add_epi32(_mm256_add_epi32(prob_aa, prob_ab), prob_bb);
-
-            // Convert to float for division
-            __m256 sum_f = _mm256_cvtepi32_ps(sum);
-            __m256 prob_ab_f = _mm256_cvtepi32_ps(prob_ab);
-            __m256 prob_bb_f = _mm256_cvtepi32_ps(prob_bb);
-
-            // Calculate dosage = (prob_ab + 2 * prob_bb) / sum
-            __m256 dosage = _mm256_div_ps(_mm256_fmadd_ps(two, prob_bb_f, prob_ab_f), sum_f);
-
-            // Create NaN mask for missing values
-            __m256 nan_val = _mm256_set1_ps(std::nanf(""));
-            dosage = _mm256_blendv_ps(dosage, nan_val, _mm256_castsi256_ps(is_missing_mask));
-
-            _mm256_storeu_ps(output + i, dosage);
-        }
+        i = v11_avx2(buffer, n_samples, output, i);
     }
 #elif defined(__aarch64__)
     if (g_has_neon) {

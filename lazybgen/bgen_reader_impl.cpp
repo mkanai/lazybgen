@@ -1,11 +1,16 @@
 #include "bgen_reader_impl.h"
 
-#if defined(__AVX2__)
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
+// Baseline x86-64 build: only scan_dosages_avx2 below uses AVX2, behind a
+// runtime check (see genotype_parser_simd.cpp).
+#define LAZYBGEN_X86_AVX2 1
+#define LAZYBGEN_TARGET_AVX2 __attribute__((target("avx2")))
 #endif
 
 #include "format/bgen_header.h"
 #include "format/genotype_parser.h"
+#include "format/genotype_parser_simd.h"  // cpu_has_avx2
 #include "format/variant_parser.h"
 #include "index/bgi_reader.h"
 #include "io/fsspec_file_reader.h"
@@ -499,7 +504,7 @@ class BgenReaderImpl::Impl {
         return scan_dosages_scalar(values, n);
     }
 
-#if defined(__AVX2__)
+#if defined(LAZYBGEN_X86_AVX2)
     // The scalar loop above will not auto-vectorize, and cannot be made to:
     // vminpd returns its second operand when either is NaN, so a NaN would
     // poison the accumulator, and the compiler will not reorder around that.
@@ -513,7 +518,13 @@ class BgenReaderImpl::Impl {
     // so it keeps the scalar loop rather than a second copy of this.
     // A non-template overload, which wins over the template above for an exact
     // double match. An explicit specialization is not allowed at class scope.
+    // It takes the AVX2 path only on a CPU that has it.
     static DosageStats scan_dosages(const double* values, size_t n) {
+        return ::lazybgen::bgen::cpu_has_avx2() ? scan_dosages_avx2(values, n)
+                                                : scan_dosages_scalar(values, n);
+    }
+
+    LAZYBGEN_TARGET_AVX2 static DosageStats scan_dosages_avx2(const double* values, size_t n) {
         const __m256d pos_inf = _mm256_set1_pd(std::numeric_limits<double>::infinity());
         const __m256d neg_inf = _mm256_set1_pd(-std::numeric_limits<double>::infinity());
         const __m256d all_ones = _mm256_castsi256_pd(_mm256_set1_epi32(-1));
@@ -560,7 +571,7 @@ class BgenReaderImpl::Impl {
         }
         return DosageStats{lo, hi, nan_seen};
     }
-#endif  // __AVX2__
+#endif  // LAZYBGEN_X86_AVX2
 
     // Fold per-variant summaries into one. DosageStats defaults to +inf/-inf,
     // so an entry no worker wrote leaves the combined bounds unchanged instead

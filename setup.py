@@ -42,17 +42,16 @@ if _setuptools_major < MIN_SETUPTOOLS:
 EXTRA_COMPILE_ARGS = ["-O3", "-funroll-loops"]
 EXTRA_LINK_ARGS = []
 
-# Add SIMD optimizations for x86_64 architectures
-if platform.machine() in ["x86_64", "AMD64"]:
-    if sys.platform != "win32":
-        EXTRA_COMPILE_ARGS += ["-mavx", "-mavx2", "-mfma"]
+# No -mavx2 / -mfma / /arch:AVX2: the extension is built for baseline x86-64 so
+# it imports on CPUs without AVX2 (issue #8). The AVX2 kernels enable those
+# instructions per function and are chosen at runtime.
 
 if sys.platform == "darwin":
     EXTRA_COMPILE_ARGS += ["-stdlib=libc++", "-std=c++14"]
 elif sys.platform == "linux":
     EXTRA_COMPILE_ARGS += ["-std=c++14"]
 elif sys.platform == "win32":
-    EXTRA_COMPILE_ARGS = ["/O2", "/std:c++14", "/arch:AVX2"]
+    EXTRA_COMPILE_ARGS = ["/O2", "/std:c++14"]
 
 # Base directory for the BGEN extension sources (the package directory)
 BGEN_DIR = Path("lazybgen")

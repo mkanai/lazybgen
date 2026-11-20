@@ -23,6 +23,10 @@ namespace bgen {
 // Check if this sample's dosage computation can use SIMD
 bool can_use_simd_dosage();
 
+// True when the CPU supports AVX2 and FMA (x86-64 only; false elsewhere). The
+// extension is built for baseline x86-64, so AVX2 code paths must check this.
+bool cpu_has_avx2();
+
 // SIMD implementations for different bit depths
 namespace simd {
 
