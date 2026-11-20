@@ -25,7 +25,9 @@ bool backend_for(const std::string& f, const std::string& transport, Backend* ou
         }
         return false;
     }
-    if (f.rfind("gs://", 0) == 0) { *out = {"gcsfs", "GCSFileSystem"}; return true; }
+    // gs:// goes through lazybgen's factory, which picks the gcsfs class that is
+    // safe in this process (see gcs_filesystem in lazybgen/remote.py).
+    if (f.rfind("gs://", 0) == 0) { *out = {"lazybgen.remote", "gcs_filesystem"}; return true; }
     if (f.rfind("s3://", 0) == 0) { *out = {"s3fs", "S3FileSystem"}; return true; }
     return false;
 }
@@ -102,10 +104,10 @@ void FsspecFileReader::initialize_python() {
 
     fs_module_ = PyImport_ImportModule(backend.module);
     if (!fs_module_) {
-        // The obstore adapter ships with lazybgen, so only the fsspec backends are
-        // something the user can install; naming the module to pip-install would be
-        // nonsense for the other one.
-        std::string detail = transport_ == "obstore"
+        // lazybgen's own modules (the obstore adapter, the gcsfs factory) ship with
+        // the package, so only third-party backends are something the user can
+        // install; naming a lazybgen module to pip-install would be nonsense.
+        std::string detail = std::string(backend.module).rfind("lazybgen.", 0) == 0
                                  ? std::string(". This is an internal module and should "
                                                "always be importable")
                                  : std::string(". Please install: pip install ") + backend.module;

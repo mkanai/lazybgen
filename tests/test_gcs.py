@@ -8,6 +8,7 @@ network-free BGI cache/download unit tests live in test_bgi_cache.py.
 
 import contextlib
 import os
+import sys
 import warnings
 from pathlib import Path
 
@@ -195,13 +196,14 @@ class TestGCSIntegration:
         # Install the byte counter BEFORE the reader opens, so every range fetch
         # the open sets up is counted.
         with _counting_gcs_bytes() as fetched:
-            reader = BgenReader(GCS_LARGE_BGEN, bgi_path=GCS_LARGE_BGEN + ".bgi", remote_backend="fsspec")
-            # Measure only the genotype read path, not the one-time header/sample
-            # parse done at open (which fills the larger sequential buffer).
-            fetched["bytes"] = 0
-            # block_size=1 routes one variant through the small-block path.
-            for _info, _dosage in reader.iter_variants(block_size=1):
-                break
+            with BgenReader(GCS_LARGE_BGEN, bgi_path=GCS_LARGE_BGEN + ".bgi", remote_backend="fsspec") as reader:
+                # Measure only the genotype read path, not the one-time header/sample
+                # parse done at open (which fills the larger sequential buffer).
+                fetched["bytes"] = 0
+                # block_size=1 routes one variant through the small-block path.
+                for _info, _dosage in reader.iter_variants(block_size=1):
+                    break
+            # Closing inside the hook stops any background prefetch before counting.
 
         # One variant's record for this fixture is well under 1 MB; allow slack
         # for the readahead block + metadata window, but stay far below the
@@ -228,7 +230,8 @@ class TestGCSIntegration:
             pytest.skip(f"large fixture unavailable: {exc}")
 
         with _counting_gcs_bytes() as fetched:
-            BgenReader(GCS_LARGE_BGEN, bgi_path=GCS_LARGE_BGEN + ".bgi", remote_backend="fsspec")
+            with BgenReader(GCS_LARGE_BGEN, bgi_path=GCS_LARGE_BGEN + ".bgi", remote_backend="fsspec"):
+                pass
 
         # The header + sample block for this fixture are well under 4 MB; the
         # pre-fix 10 MB buffer fetched ~11 MB.
@@ -535,37 +538,30 @@ class TestGCSRequesterPays:
         np.testing.assert_array_equal(via_obstore[~np.isnan(via_obstore)], via_fsspec[~np.isnan(via_fsspec)])
 
 
-@pytest.mark.integration
-@pytest.mark.skipif(
-    not __import__("lazybgen.obstore_backend", fromlist=["is_available"]).is_available(),
-    reason="obstore not installed",
-)
-def test_a_forked_child_still_reads_after_an_obstore_read():
-    """A read in a forked child must not hang, whatever the parent used.
+def _assert_forked_child_reads(url, child_backend, what):
+    """Fork, read ``url`` in the child, and fail if the child hangs or errors.
 
-    obstore drives its requests on a tokio runtime that does not survive fork(),
-    and a child that inherits a used one blocks forever rather than failing. That
-    matters because sharding a workload across processes is the documented way to
-    get more remote bandwidth, and `fork` is the default start method on Linux.
-    The reader detects the situation and falls back to fsspec; this test is the
-    guard, and it fails by timing out if the fallback ever stops working.
+    A broken fork path blocks forever rather than raising, so the child gets a
+    deadline and the test fails by timing out.
     """
-    import os
     import time
-
-    url = f"{GCS_DATA}/example.16bits.bgen"
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        load_bgen(url, nan_action="warn", remote_backend="obstore")
 
     read_fd, write_fd = os.pipe()
     pid = os.fork()
     if pid == 0:  # pragma: no cover - runs only in the child
         os.close(read_fd)
+        if sys.platform == "darwin":
+            # macOS's system proxy lookup (urllib -> SystemConfiguration) is not
+            # fork-safe and segfaults a forked child of a threaded process. It is
+            # reached when google-auth refreshes user credentials over requests.
+            # With no_proxy set, urllib reads proxies from the environment
+            # instead. This sidesteps a platform limit unrelated to the fallback
+            # under test; Linux, where fork is the default start method, is unaffected.
+            os.environ["no_proxy"] = "*"
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                load_bgen(url, nan_action="warn")  # "auto": must fall back, not hang
+                load_bgen(url, nan_action="warn", remote_backend=child_backend)
             os.write(write_fd, b"ok")
             os._exit(0)
         except BaseException:
@@ -584,8 +580,50 @@ def test_a_forked_child_still_reads_after_an_obstore_read():
         os.kill(pid, 9)
         os.waitpid(pid, 0)
         os.close(read_fd)
-        pytest.fail("the forked child hung: the obstore-after-fork fallback is not working")
+        pytest.fail(f"the forked child hung: {what} is not working")
 
     payload = os.read(read_fd, 2)
     os.close(read_fd)
     assert exit_code == 0 and payload == b"ok"
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not __import__("lazybgen.obstore_backend", fromlist=["is_available"]).is_available(),
+    reason="obstore not installed",
+)
+def test_a_forked_child_still_reads_after_an_obstore_read():
+    """A read in a forked child must not hang, whatever the parent used.
+
+    obstore drives its requests on a tokio runtime that does not survive fork(),
+    and a child that inherits a used one blocks forever rather than failing. That
+    matters because sharding a workload across processes is the documented way to
+    get more remote bandwidth, and `fork` is the default start method on Linux.
+    The reader detects the situation and falls back to fsspec; this test is the
+    guard, and it fails by timing out if the fallback ever stops working.
+    """
+    url = f"{GCS_DATA}/example.16bits.bgen"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        load_bgen(url, nan_action="warn", remote_backend="obstore")
+
+    _assert_forked_child_reads(url, "auto", "the obstore-after-fork fallback")
+
+
+@pytest.mark.integration
+def test_a_forked_child_still_reads_after_an_fsspec_read():
+    """A forked child's fsspec read must not hang after the parent read via fsspec.
+
+    Since gcsfs 2026.10 the class gcsfs exports looks up each bucket's type over
+    gRPC when credentials are available, and that can hang in a forked child.
+    lazybgen gives every forked child gcsfs's core (HTTP-only) class instead.
+    Without credentials the lookup fails fast, so this end-to-end check only
+    bites where credentials exist (a GCE VM, or application-default
+    credentials); test_fork_gcsfs.py checks the class selection in CI.
+    """
+    url = f"{GCS_DATA}/example.16bits.bgen"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        load_bgen(url, nan_action="warn", remote_backend="fsspec")
+
+    _assert_forked_child_reads(url, "fsspec", "the core-gcsfs fork path")

@@ -52,6 +52,70 @@ def is_remote_path(path: str) -> bool:
     return path.startswith(REMOTE_SCHEMES)
 
 
+# Since gcsfs 2026.10, ``gcsfs.GCSFileSystem`` is an extended class that looks up
+# each bucket's type over gRPC before opening a file whenever credentials are
+# available. In a forked child that lookup can hang forever (or crash) with no
+# error. It was observed on Linux and macOS after the parent read through fsspec,
+# and on macOS also after the parent read only through obstore, which builds no
+# gcsfs filesystem; the parent's gRPC state can equally come from gcsfs use
+# outside lazybgen. Rather than guess which parents are safe, every forked child uses
+# gcsfs's core class, which reads over plain HTTP. The cost is that a forked
+# child cannot read zonal ("Rapid") buckets, which need gRPC. Unforked processes
+# keep the exported class unchanged. A process that imports lazybgen only after
+# being forked is not detected; import lazybgen before forking workers.
+_forked = False
+_logged_core_switch = False
+
+
+def _mark_forked() -> None:
+    # Only a flag write: at-fork hooks must not take locks or import modules.
+    global _forked
+    _forked = True
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_mark_forked)
+
+
+def _gcsfs_classes():
+    """Return gcsfs's (exported, core) filesystem classes."""
+    try:
+        import gcsfs
+        from gcsfs.core import GCSFileSystem as core
+    except ImportError as exc:
+        raise ImportError("gcsfs is required for gs:// support. Install with: pip install gcsfs") from exc
+    return gcsfs.GCSFileSystem, core
+
+
+def gcs_filesystem_class(candidate=None):
+    """Return the gcsfs class to use in this process for ``candidate``.
+
+    ``candidate`` defaults to the class gcsfs exports. In a forked child, gcsfs's
+    exported extended class is swapped for its core class (see the comment
+    above); any other class, such as a user-registered ``gs`` implementation, is
+    returned unchanged.
+    """
+    global _logged_core_switch
+    exported, core = _gcsfs_classes()
+    if candidate is None:
+        candidate = exported
+    if _forked and candidate is exported and exported is not core:
+        if not _logged_core_switch:
+            _logged_core_switch = True
+            logger.info(
+                "Forked process: gs:// reads use gcsfs's core (HTTP-only) filesystem, because the "
+                "extended one can hang after fork(). Zonal buckets are not readable here; use the "
+                "'spawn' or 'forkserver' multiprocessing start method to read them."
+            )
+        return core
+    return candidate
+
+
+def gcs_filesystem(**storage_options):
+    """Build the gcsfs filesystem for this process (see ``gcs_filesystem_class``)."""
+    return gcs_filesystem_class()(**storage_options)
+
+
 def resolve_remote_backend(path: str, storage_options: Optional[Dict] = None, backend: Optional[str] = None) -> str:
     """Pick the transport for a remote path: ``"fsspec"`` or ``"obstore"``.
 
@@ -299,7 +363,12 @@ def ensure_local_bgi(bgi_path: str, storage_options: Optional[Dict] = None, back
             else:
                 import fsspec
 
-                download = fsspec.filesystem(scheme, **(storage_options or {})).get
+                if _forked and scheme == "gs":
+                    # Keep the registry's choice unless it is gcsfs's extended class.
+                    fs_class = gcs_filesystem_class(fsspec.get_filesystem_class(scheme))
+                    download = fs_class(**(storage_options or {})).get
+                else:
+                    download = fsspec.filesystem(scheme, **(storage_options or {})).get
 
             logger.info(f"Downloading BGI index from {bgi_path} to {local_path}...")
             # Download to a unique temp file in the SAME directory, then atomically
