@@ -436,6 +436,9 @@ class BgenReaderImpl::Impl {
     // never look at, and callers that supply their own .sample file discard
     // them outright.
     const std::vector<std::string>& sample_ids() {
+        if (header_.has_sample_ids && !embedded_ids_loaded_) {
+            load_embedded_sample_ids();
+        }
         if (sample_ids_.empty() && !header_.has_sample_ids && header_.n_samples > 0) {
             sample_ids_.reserve(header_.n_samples);
             for (uint32_t i = 0; i < header_.n_samples; ++i) {
@@ -1149,49 +1152,56 @@ class BgenReaderImpl::Impl {
         }
     }
 
-    // Read sample IDs
+    // Locate the embedded sample-ID block and check its sample count, without
+    // reading the IDs. Building one string per sample is the bulk of opening a
+    // biobank-scale file, and a reader given a .sample file never uses these;
+    // sample_ids() parses the block the first time anyone asks for it.
     void read_sample_ids() {
         if (header_.has_sample_ids) {
             // Current position should be right after header
-            uint64_t sample_block_pos = file_reader_->tell();
+            const uint64_t sample_block_pos = file_reader_->tell();
 
-            // Read sample block size
-            uint8_t size_buffer[4];
-            size_t bytes_read = file_reader_->read(size_buffer, 4);
-            if (bytes_read < 4) {
+            // L_SI (the block's length, counting these 4 bytes) and N.
+            uint8_t prefix[8];
+            if (file_reader_->read(prefix, 8) < 8) {
                 throw std::runtime_error("Failed to read sample block size");
             }
+            const uint32_t block_size = read_u32_le(prefix);
+            const uint32_t n_in_block = read_u32_le(prefix + 4);
 
-            // Convert from little-endian
-            uint32_t block_size_with_n = static_cast<uint32_t>(size_buffer[0]) |
-                                         (static_cast<uint32_t>(size_buffer[1]) << 8) |
-                                         (static_cast<uint32_t>(size_buffer[2]) << 16) |
-                                         (static_cast<uint32_t>(size_buffer[3]) << 24);
-
-            // Sanity check the block size (should include sample count)
-            if (block_size_with_n < 4 || block_size_with_n > 100000000) {  // 100MB max
+            // Sanity check the block size (it covers L_SI and N at least)
+            if (block_size < 8 || block_size > 100000000) {  // 100MB max
                 throw std::runtime_error("Invalid sample block size: " +
-                                         std::to_string(block_size_with_n));
+                                         std::to_string(block_size));
             }
-
-            // Read full sample block (including the 4-byte size prefix)
-            std::vector<uint8_t> sample_buffer(block_size_with_n + 4);
-            file_reader_->seek(sample_block_pos);
-            bytes_read = file_reader_->read(sample_buffer.data(), block_size_with_n + 4);
-            if (bytes_read < block_size_with_n + 4) {
-                throw std::runtime_error("Failed to read sample block");
+            if (n_in_block != header_.n_samples) {
+                throw std::runtime_error("Sample count mismatch: expected " +
+                                         std::to_string(header_.n_samples) + ", got " +
+                                         std::to_string(n_in_block));
             }
-
-            // Parse sample block
-            auto sample_block =
-                SampleBlockParser::parse(sample_buffer.data(), bytes_read, header_.n_samples);
-            sample_ids_ = std::move(sample_block.sample_ids);
-
-            // Update offset to skip sample block
-            header_.offset = sample_block_pos + block_size_with_n + 4;
+            sample_block_pos_ = sample_block_pos;
+            sample_block_size_ = block_size;
         }
         // With no sample block there is nothing to read; sample_ids() builds the
         // placeholder IDs if anyone asks for them.
+    }
+
+    static uint32_t read_u32_le(const uint8_t* b) {
+        return static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[1]) << 8) |
+               (static_cast<uint32_t>(b[2]) << 16) | (static_cast<uint32_t>(b[3]) << 24);
+    }
+
+    // Parse the embedded sample-ID block located at open.
+    void load_embedded_sample_ids() {
+        std::vector<uint8_t> buffer(sample_block_size_);
+        file_reader_->seek(sample_block_pos_);
+        const size_t got = file_reader_->read(buffer.data(), sample_block_size_);
+        if (got < sample_block_size_) {
+            throw std::runtime_error("Failed to read sample block");
+        }
+        auto sample_block = SampleBlockParser::parse(buffer.data(), got, header_.n_samples);
+        sample_ids_ = std::move(sample_block.sample_ids);
+        embedded_ids_loaded_ = true;
     }
 
     // Create default decompressor
@@ -1212,6 +1222,9 @@ class BgenReaderImpl::Impl {
     std::unique_ptr<decompress::VariantDecompressor> decompressor_;
     BgenHeader header_;
     std::vector<std::string> sample_ids_;
+    uint64_t sample_block_pos_ = 0;
+    uint32_t sample_block_size_ = 0;
+    bool embedded_ids_loaded_ = false;
     DosageStats last_block_stats_{std::numeric_limits<double>::infinity(),
                                   -std::numeric_limits<double>::infinity(), false};
     bool is_open_;

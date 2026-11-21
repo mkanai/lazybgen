@@ -110,7 +110,8 @@ SampleBlock SampleBlockParser::parse(const uint8_t* buffer, size_t size,
     block.block_size = read_le<uint32_t>(buffer + pos);
     pos += 4;
 
-    if (size < block.block_size + 4) {
+    // L_SI counts its own 4 bytes, so the block is exactly block_size bytes.
+    if (size < block.block_size) {
         throw std::runtime_error("Buffer too small for complete sample block");
     }
 
