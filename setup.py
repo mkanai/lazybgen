@@ -53,6 +53,37 @@ elif sys.platform == "linux":
 elif sys.platform == "win32":
     EXTRA_COMPILE_ARGS = ["/O2", "/std:c++14"]
 
+def jcc_erratum_args():
+    """Assembler flag that keeps jumps from crossing 32-byte boundaries, or [].
+
+    Intel's microcode fix for the Skylake-family JCC erratum (Skylake through
+    Cascade Lake, still common in clusters and clouds) stops the decoded-uop
+    cache from holding any jump that crosses or ends on a 32-byte boundary.
+    Whether libdeflate's inflate loop has such a jump depends on where the
+    linker happens to place it, so its speed swung by ~13% between builds of
+    unrelated code. Padding the jumps away makes it fast at every placement
+    (9-12% faster zlib reads on an n2 Cascade Lake host, zstd unchanged), and
+    costs nothing measurable on CPUs without the erratum. Only x86-64 Linux
+    builds take it; the flag is probed so an assembler without it still builds.
+    """
+    if sys.platform != "linux" or platform.machine().lower() not in ("x86_64", "amd64"):
+        return []
+    flag = "-Wa,-mbranches-within-32B-boundaries"
+    import tempfile
+
+    compiler = new_compiler()
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "probe.c"
+        src.write_text("int lazybgen_probe(int x) { return x ? x * 3 : 1; }\n")
+        try:
+            compiler.compile([str(src)], output_dir=tmp, extra_preargs=[flag])
+        except Exception:
+            return []
+    return [flag]
+
+
+JCC_ARGS = jcc_erratum_args()
+
 # Base directory for the BGEN extension sources (the package directory)
 BGEN_DIR = Path("lazybgen")
 BUILD_DIR = Path("build")
@@ -107,7 +138,7 @@ def build_libdeflate():
             compiler.compiler_so[0] = "clang"
             compiler.compiler[0] = "clang"
 
-        compile_args = ["-O2", "-fPIC", "-I" + str(ld_dir)]
+        compile_args = ["-O2", "-fPIC"] + JCC_ARGS + ["-I" + str(ld_dir)]
         objects = compiler.compile(sources, output_dir=str(ld_build_dir), extra_preargs=compile_args)
 
         lib_path = ld_build_dir / "libdeflate.a"
