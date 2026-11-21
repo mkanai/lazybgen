@@ -58,6 +58,11 @@ struct DosageStats {
     bool has_nan = false;
 };
 
+// Worker threads a block decode starts when num_threads is 0: the CPUs this
+// process may use (its affinity mask and any cgroup CPU quota on Linux), not
+// the machine's core count. Computed once per process.
+size_t default_num_threads();
+
 class BgenReaderImpl {
    public:
     /**

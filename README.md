@@ -92,8 +92,8 @@ A `.bgi` index is required; create one with `bgenix -g file.bgen`.
 - `nan_action`: how to handle missing dosages: `"error"` (default, raise),
   `"mean"` (impute with the per-variant mean), `"omit"` (drop affected samples),
   or `"warn"` (keep NaNs and log a warning)
-- `num_threads`: worker threads for decoding. `0` (default) auto-detects the CPU
-  core count and decodes blocks in parallel; `1` forces single-threaded decoding;
+- `num_threads`: worker threads for decoding. `0` (default) uses one per CPU the
+  process may run on and decodes blocks in parallel; `1` forces single-threaded decoding;
   `N > 1` uses N threads (see [Parallel decode](#parallel-decode))
 - `storage_options`: cloud backend kwargs, in fsspec spelling whichever transport
   serves them (e.g. `{"anon": True}` for public S3, `{"requester_pays": True}` to
@@ -218,8 +218,11 @@ all-samples and sample-filtered (cohort) reads, and scales with the sample and
 core count: on a 16-core machine at 100k samples, a full decode is 6.8x faster
 than `num_threads=1` and a 2000-variant region 6.6x.
 
-Control the worker count with `num_threads`: `0` (default) auto-detects the core
-count, `1` forces single-threaded decoding, and `N > 1` uses N threads.
+Control the worker count with `num_threads`: `0` (default) starts one worker per
+CPU the process may use, `1` forces single-threaded decoding, and `N > 1` uses N
+threads. On Linux the default follows the process's CPU affinity and any cgroup
+CPU quota, so a SLURM job, `taskset`, or a container limited to 4 CPUs gets 4
+workers, not one per core of the machine.
 
 ```python
 # Parallel by default (auto-detected cores)

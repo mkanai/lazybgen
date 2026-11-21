@@ -20,6 +20,11 @@ from .remote import is_remote_path, choose_remote_block_size, resolve_remote_bac
 from .region import validate_region_bounds
 
 
+def _default_num_threads():
+    """Workers a parallel decode starts for num_threads=0 (affinity- and cgroup-aware)."""
+    return default_num_threads()
+
+
 def _validate_dtype(dtype):
     """Reject a non-floating output dtype before any decode.
 

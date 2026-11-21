@@ -128,6 +128,9 @@ cdef extern from "format/genotype_parser.h" namespace "lazybgen::bgen":
 
 # Main BGEN reader class
 cdef extern from "bgen_reader_impl.h" namespace "lazybgen::io::bgen":
+    size_t default_num_threads()
+
+cdef extern from "bgen_reader_impl.h" namespace "lazybgen::io::bgen":
     cdef struct DosageStats:
         double min_value
         double max_value

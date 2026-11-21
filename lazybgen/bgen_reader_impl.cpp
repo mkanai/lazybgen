@@ -12,6 +12,9 @@
 #include "index/bgi_reader.h"
 #include "io/fsspec_file_reader.h"
 #include <fcntl.h>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -35,7 +38,116 @@ namespace {
 bool is_remote_scheme(const std::string& f) {
     return f.rfind("gs://", 0) == 0 || f.rfind("s3://", 0) == 0;
 }
+
+#if defined(__linux__)
+// CPUs a cgroup quota allows ("max" or unset -> 0, meaning no limit). v2 keeps
+// "quota period" in cpu.max; v1 keeps the two in cpu.cfs_quota_us and
+// cpu.cfs_period_us, with quota -1 for unlimited.
+size_t quota_cpus(long long quota, long long period) {
+    if (quota <= 0 || period <= 0) {
+        return 0;
+    }
+    return static_cast<size_t>(std::max<long long>(1, (quota + period - 1) / period));
+}
+
+size_t cgroup_v2_cpus(const std::string& dir) {
+    std::ifstream f(dir + "/cpu.max");
+    std::string quota;
+    long long period = 0;
+    if (!(f >> quota >> period) || quota == "max") {
+        return 0;
+    }
+    try {
+        return quota_cpus(std::stoll(quota), period);
+    } catch (const std::exception&) {
+        return 0;
+    }
+}
+
+size_t cgroup_v1_cpus(const std::string& dir) {
+    long long quota = -1;
+    long long period = 0;
+    std::ifstream fq(dir + "/cpu.cfs_quota_us");
+    std::ifstream fp(dir + "/cpu.cfs_period_us");
+    if (!(fq >> quota) || !(fp >> period)) {
+        return 0;
+    }
+    return quota_cpus(quota, period);
+}
+
+// Tightest CPU quota on this process's cgroup or any of its ancestors, or 0.
+size_t cgroup_cpu_limit() {
+    std::ifstream f("/proc/self/cgroup");
+    std::string line;
+    size_t limit = 0;
+    auto take = [&limit](size_t n) {
+        if (n > 0 && (limit == 0 || n < limit)) {
+            limit = n;
+        }
+    };
+    while (std::getline(f, line)) {
+        // "hierarchy-id:controllers:path"; v2 is "0::path".
+        const size_t a = line.find(':');
+        const size_t b = a == std::string::npos ? a : line.find(':', a + 1);
+        if (b == std::string::npos) {
+            continue;
+        }
+        const std::string controllers = line.substr(a + 1, b - a - 1);
+        std::string path = line.substr(b + 1);
+        const bool v2 = controllers.empty();
+        // v1: only the hierarchy carrying the "cpu" controller, mounted under
+        // its controller list (e.g. /sys/fs/cgroup/cpu,cpuacct).
+        if (!v2 && ("," + controllers + ",").find(",cpu,") == std::string::npos) {
+            continue;
+        }
+        const std::string root =
+            v2 ? std::string("/sys/fs/cgroup") : "/sys/fs/cgroup/" + controllers;
+        // Walk from the process's cgroup up to the root; a parent's quota caps
+        // its children. Inside a container the path may not exist under this
+        // mount, in which case the root files still apply.
+        while (true) {
+            const std::string dir = root + (path == "/" ? std::string() : path);
+            take(v2 ? cgroup_v2_cpus(dir) : cgroup_v1_cpus(dir));
+            if (path.empty() || path == "/") {
+                break;
+            }
+            const size_t slash = path.find_last_of('/');
+            path = slash == 0 || slash == std::string::npos ? "/" : path.substr(0, slash);
+        }
+    }
+    return limit;
+}
+#endif
+
 }  // namespace
+
+size_t default_num_threads() {
+    // Computed once: affinity and quotas are set when a job starts, and this
+    // runs on every block decode.
+    static const size_t n = [] {
+        size_t cpus = std::thread::hardware_concurrency();
+#if defined(__linux__)
+        // A SLURM allocation, taskset or a container cpuset narrows the CPUs
+        // this process may run on without changing the machine's core count,
+        // and a cgroup quota limits how much of them it may use. Starting one
+        // worker per core of the machine then oversubscribes the job.
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+            const int allowed = CPU_COUNT(&set);
+            if (allowed > 0 && (cpus == 0 || static_cast<size_t>(allowed) < cpus)) {
+                cpus = static_cast<size_t>(allowed);
+            }
+        }
+        const size_t quota = cgroup_cpu_limit();
+        if (quota > 0 && (cpus == 0 || quota < cpus)) {
+            cpus = quota;
+        }
+#endif
+        return cpus == 0 ? static_cast<size_t>(1) : cpus;
+    }();
+    return n;
+}
 
 // Using directives for nested namespaces
 using index::BgiReader;
@@ -696,7 +808,7 @@ class BgenReaderImpl::Impl {
         if (n_variants == 0) {
             return;
         }
-        size_t hw = num_threads ? num_threads : std::thread::hardware_concurrency();
+        size_t hw = num_threads ? num_threads : default_num_threads();
         if (hw == 0) {
             hw = 1;
         }
