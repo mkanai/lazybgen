@@ -98,7 +98,9 @@ LAZYBGEN_TARGET_AVX2 static size_t filtered_8bit_avx2(const uint8_t* prob_data, 
                                                const int* sample_indices, size_t n_indices,
                                                const uint8_t* missing_mask, size_t i) {
     // Process 8 samples at a time with AVX2
-    const __m256 scale = _mm256_set1_ps(1.0f / 255.0f);
+    // Divide (not multiply by 1/255) so every lane rounds exactly like the
+    // scalar tail and the full-sample decode.
+    const __m256 denom = _mm256_set1_ps(255.0f);
     const __m256 two = _mm256_set1_ps(2.0f);
 
     for (; i + 7 < n_indices; i += 8) {
@@ -132,7 +134,7 @@ LAZYBGEN_TARGET_AVX2 static size_t filtered_8bit_avx2(const uint8_t* prob_data, 
         // Convert to float and calculate dosage
         __m256 prob_ab_f = _mm256_cvtepi32_ps(prob_ab_vec);
         __m256 prob_bb_f = _mm256_cvtepi32_ps(prob_bb);
-        __m256 dosage = _mm256_mul_ps(_mm256_fmadd_ps(two, prob_bb_f, prob_ab_f), scale);
+        __m256 dosage = _mm256_div_ps(_mm256_fmadd_ps(two, prob_bb_f, prob_ab_f), denom);
 
         float result[8];
         _mm256_storeu_ps(result, dosage);
@@ -168,7 +170,8 @@ static void compute_dosages_filtered_8bit_simd(const uint8_t* prob_data, float* 
 #elif defined(__aarch64__)
     if (g_has_neon) {
         // Process 4 samples at a time with NEON
-        const float32x4_t scale = vdupq_n_f32(1.0f / 255.0f);
+        // Divide (not multiply by 1/255) to match the scalar decode exactly.
+        const float32x4_t denom = vdupq_n_f32(255.0f);
         const float32x4_t two = vdupq_n_f32(2.0f);
 
         for (; i + 3 < n_indices; i += 4) {
@@ -198,7 +201,7 @@ static void compute_dosages_filtered_8bit_simd(const uint8_t* prob_data, float* 
             // Convert to float and calculate dosage
             float32x4_t prob_ab_f = vcvtq_f32_u32(prob_ab_vec);
             float32x4_t prob_bb_f = vcvtq_f32_u32(prob_bb);
-            float32x4_t dosage = vmulq_f32(vmlaq_f32(prob_ab_f, two, prob_bb_f), scale);
+            float32x4_t dosage = vdivq_f32(vmlaq_f32(prob_ab_f, two, prob_bb_f), denom);
 
             // Store results with missing handling
             float result[4];
@@ -246,7 +249,8 @@ LAZYBGEN_TARGET_AVX2 static size_t filtered_16bit_avx2(const uint8_t* prob_data,
                                                const int* sample_indices, size_t n_indices,
                                                const uint8_t* missing_mask, size_t i) {
     // Process 8 samples at a time with AVX2
-    const __m256 scale = _mm256_set1_ps(1.0f / 65535.0f);
+    // Divide, as in the 8-bit kernel, to match the scalar decode exactly.
+    const __m256 denom = _mm256_set1_ps(65535.0f);
     const __m256 two = _mm256_set1_ps(2.0f);
 
     for (; i + 7 < n_indices; i += 8) {
@@ -274,7 +278,7 @@ LAZYBGEN_TARGET_AVX2 static size_t filtered_16bit_avx2(const uint8_t* prob_data,
         // Convert to float and calculate dosage
         __m256 prob_ab_f = _mm256_cvtepi32_ps(prob_ab);
         __m256 prob_bb_f = _mm256_cvtepi32_ps(prob_bb);
-        __m256 dosage = _mm256_mul_ps(_mm256_fmadd_ps(two, prob_bb_f, prob_ab_f), scale);
+        __m256 dosage = _mm256_div_ps(_mm256_fmadd_ps(two, prob_bb_f, prob_ab_f), denom);
 
         float result[8];
         _mm256_storeu_ps(result, dosage);
@@ -308,7 +312,8 @@ static void compute_dosages_filtered_16bit_simd(const uint8_t* prob_data, float*
 #elif defined(__aarch64__)
     if (g_has_neon) {
         // Process 4 samples at a time with NEON
-        const float32x4_t scale = vdupq_n_f32(1.0f / 65535.0f);
+        // Divide, as in the 8-bit kernel, to match the scalar decode exactly.
+        const float32x4_t denom = vdupq_n_f32(65535.0f);
         const float32x4_t two = vdupq_n_f32(2.0f);
 
         for (; i + 3 < n_indices; i += 4) {
@@ -339,7 +344,7 @@ static void compute_dosages_filtered_16bit_simd(const uint8_t* prob_data, float*
             // Convert to float and calculate dosage
             float32x4_t prob_ab_f = vcvtq_f32_u32(prob_ab_32);
             float32x4_t prob_bb_f = vcvtq_f32_u32(prob_bb_32);
-            float32x4_t dosage = vmulq_f32(vmlaq_f32(prob_ab_f, two, prob_bb_f), scale);
+            float32x4_t dosage = vdivq_f32(vmlaq_f32(prob_ab_f, two, prob_bb_f), denom);
 
             float result[4];
             vst1q_f32(result, dosage);
