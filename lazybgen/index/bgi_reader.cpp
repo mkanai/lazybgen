@@ -93,8 +93,8 @@ class BgiReader::Impl {
         // Query database directly without cache
         sqlite3_reset(stmt_by_region_);
         sqlite3_bind_text(stmt_by_region_, 1, chromosome.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int(stmt_by_region_, 2, start_pos);
-        sqlite3_bind_int(stmt_by_region_, 3, end_pos);
+        sqlite3_bind_int64(stmt_by_region_, 2, static_cast<sqlite3_int64>(start_pos));
+        sqlite3_bind_int64(stmt_by_region_, 3, static_cast<sqlite3_int64>(end_pos));
 
         return execute_query(stmt_by_region_);
     }
@@ -202,7 +202,7 @@ class BgiReader::Impl {
             // Bind parameters
             sqlite3_bind_text(stmt, 1, chromosome.c_str(), -1, SQLITE_STATIC);
             for (size_t j = 0; j < batch_size_actual; ++j) {
-                sqlite3_bind_int(stmt, 2 + j, unique_pos_vec[i + j]);
+                sqlite3_bind_int64(stmt, 2 + j, static_cast<sqlite3_int64>(unique_pos_vec[i + j]));
             }
 
             // Execute and collect results

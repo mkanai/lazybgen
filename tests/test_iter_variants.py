@@ -126,6 +126,27 @@ def test_iter_variants_region_matches_batch(bgen_path):
     np.testing.assert_array_equal(streamed[finite], batch[finite])
 
 
+@pytest.mark.parametrize("bounds", [{}, {"region_start": 1}])
+def test_open_ended_region_returns_the_whole_chromosome(bgen_path, bounds):
+    """Omitting region_end selects through the end of the chromosome.
+
+    Without an end, the reader asks the index for positions up to 0xFFFFFFFF.
+    Bound as a 32-bit int, that became -1 and matched nothing.
+    """
+    with BgenReader(bgen_path) as reader:
+        _, vinfo = reader.load_variants(dtype=np.float64)
+        chrom = str(vinfo.iloc[0]["chrom"])
+        expected = int((vinfo["chrom"] == chrom).sum())
+
+        batch, binfo = reader.load_variants(region_chrom=chrom, dtype=np.float64, **bounds)
+        rows = list(reader.iter_variants(region_chrom=chrom, dtype=np.float64, **bounds))
+
+    assert expected > 0
+    assert batch.shape[1] == expected
+    assert len(rows) == expected
+    assert set(binfo["chrom"].astype(str)) == {chrom}
+
+
 def test_iter_variants_sample_indices(bgen_path):
     """sample_indices restricts each yielded dosage to the chosen samples."""
     idx = np.array([0, 2, 4], dtype=np.int32)
