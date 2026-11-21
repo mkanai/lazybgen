@@ -85,6 +85,16 @@ struct GenotypeData {
 };
 
 // Genotype parser class
+// Range and missing-call summary of one decoded column, filled by the decode
+// kernels that can produce it in the same pass (valid = true). When valid is
+// false the caller computes it from the column instead.
+struct ColumnStats {
+    double min_value = 0.0;
+    double max_value = 0.0;
+    bool has_nan = false;
+    bool valid = false;
+};
+
 class GenotypeParser {
    public:
     /**
@@ -129,12 +139,16 @@ class GenotypeParser {
     // decode kernel, avoiding a separate float32->float64 cast pass in the caller
     // (~20% of a default float64 full load). Both produce byte-identical values
     // (the double output is the exact widening of the float result).
+    // If stats is non-null, it is set valid when the decode also produced the
+    // column's range (unphased 8/16-bit v1.2), and left invalid otherwise.
     static void compute_dosages_direct(const uint8_t* buffer, size_t size, LayoutType layout,
                                      CompressionType compression, uint32_t n_samples,
-                                     uint16_t n_alleles, float* output);
+                                     uint16_t n_alleles, float* output,
+                                     ColumnStats* stats = nullptr);
     static void compute_dosages_direct(const uint8_t* buffer, size_t size, LayoutType layout,
                                      CompressionType compression, uint32_t n_samples,
-                                     uint16_t n_alleles, double* output);
+                                     uint16_t n_alleles, double* output,
+                                     ColumnStats* stats = nullptr);
 
     /**
      * Compute dosages for specific samples only
@@ -163,7 +177,7 @@ class GenotypeParser {
     template <typename T>
     static void compute_dosages_direct_impl(const uint8_t* buffer, size_t size, LayoutType layout,
                                          CompressionType compression, uint32_t n_samples,
-                                         uint16_t n_alleles, T* output);
+                                         uint16_t n_alleles, T* output, ColumnStats* stats);
 
     // Direct dosage computation for v1.1 (float-only: uses a float SIMD kernel).
     static void compute_dosages_v11_direct(const uint8_t* buffer, size_t size, uint32_t n_samples,
@@ -182,13 +196,16 @@ class GenotypeParser {
     // encoding, and the AVX2 build keeps results identical to earlier releases.
     template <typename T>
     static void compute_dosages_v12_direct(const uint8_t* buffer, size_t size, uint32_t n_samples,
-                                        uint16_t n_alleles, T* output);
+                                        uint16_t n_alleles, T* output,
+                                        ColumnStats* stats);
     template <typename T>
     static void compute_dosages_v12_direct_body(const uint8_t* buffer, size_t size,
-                                             uint32_t n_samples, uint16_t n_alleles, T* output);
+                                             uint32_t n_samples, uint16_t n_alleles, T* output,
+                                        ColumnStats* stats);
     template <typename T>
     static void compute_dosages_v12_direct_avx2(const uint8_t* buffer, size_t size,
-                                             uint32_t n_samples, uint16_t n_alleles, T* output);
+                                             uint32_t n_samples, uint16_t n_alleles, T* output,
+                                        ColumnStats* stats);
 
     // Optimized filtered dosage computation for v1.2
     static void compute_dosages_v12_filtered(const uint8_t* buffer, size_t size, uint32_t n_samples,

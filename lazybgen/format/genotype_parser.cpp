@@ -1,6 +1,7 @@
 #include "genotype_parser.h"
 
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 #include "genotype_parser_simd.h"
@@ -164,27 +165,29 @@ void GenotypeParser::compute_dosages_v11_direct(const uint8_t* buffer, size_t si
 
 template <typename T>
 void GenotypeParser::compute_dosages_v12_direct(const uint8_t* buffer, size_t size, uint32_t n_samples,
-                                             uint16_t n_alleles, T* output) {
+                                             uint16_t n_alleles, T* output, ColumnStats* stats) {
 #ifdef LAZYBGEN_X86_AVX2
     if (cpu_has_avx2()) {
-        compute_dosages_v12_direct_avx2<T>(buffer, size, n_samples, n_alleles, output);
+        compute_dosages_v12_direct_avx2<T>(buffer, size, n_samples, n_alleles, output, stats);
         return;
     }
 #endif
-    compute_dosages_v12_direct_body<T>(buffer, size, n_samples, n_alleles, output);
+    compute_dosages_v12_direct_body<T>(buffer, size, n_samples, n_alleles, output, stats);
 }
 
 #ifdef LAZYBGEN_X86_AVX2
 template <typename T>
 LAZYBGEN_TARGET_AVX2 void GenotypeParser::compute_dosages_v12_direct_avx2(
-    const uint8_t* buffer, size_t size, uint32_t n_samples, uint16_t n_alleles, T* output) {
-    compute_dosages_v12_direct_body<T>(buffer, size, n_samples, n_alleles, output);
+    const uint8_t* buffer, size_t size, uint32_t n_samples, uint16_t n_alleles, T* output,
+    ColumnStats* stats) {
+    compute_dosages_v12_direct_body<T>(buffer, size, n_samples, n_alleles, output, stats);
 }
 #endif
 
 template <typename T>
 LAZYBGEN_ALWAYS_INLINE void GenotypeParser::compute_dosages_v12_direct_body(
-    const uint8_t* buffer, size_t size, uint32_t n_samples, uint16_t n_alleles, T* output) {
+    const uint8_t* buffer, size_t size, uint32_t n_samples, uint16_t n_alleles, T* output,
+    ColumnStats* stats) {
     if (n_alleles != 2) {
         throw std::runtime_error("Direct dosage computation only supported for biallelic variants");
     }
@@ -281,14 +284,33 @@ LAZYBGEN_ALWAYS_INLINE void GenotypeParser::compute_dosages_v12_direct_body(
     // Single-pass processing: read missing status and probabilities together
     const uint8_t* prob_ptr = ptr;
 
-    // NOTE: this all-samples decode is intentionally scalar. Vectorizing the
-    // arithmetic buys nothing here (~3% at best for f32, a slight regression for
-    // f64): the kernel's wall time
-    // is unchanged because it is bound by the per-sample loads/stores and the
-    // missing/invalid branch, not the multiply/divide. Decompression (~50%) is
-    // the real floor; parallelism (read_decode_block_parallel) and dtype=float32
-    // are the levers that actually move it. A fully-vectorized masked store would
-    // also reintroduce the blendv NaN-sign pitfall (see the filtered SIMD path).
+    // 8- and 16-bit go through the fused kernels, which decode branch-free
+    // (vectorized where the CPU allows) and return the column's range in the
+    // same pass. The earlier finding that vectorizing only the arithmetic of
+    // this loop bought ~3% still holds; the cost was in the per-sample branches
+    // and one-at-a-time loads and stores, which these kernels remove, and in the
+    // caller's second pass over the column, which the range replaces.
+    if (bits_per_prob == 8 || bits_per_prob == 16) {
+        const simd::NumeratorRange r =
+            bits_per_prob == 8
+                ? simd::decode_v12_unphased_8bit<T>(missing_data_ptr, prob_ptr, n_samples, output)
+                : simd::decode_v12_unphased_16bit<T>(missing_data_ptr, prob_ptr, n_samples, output);
+        if (stats) {
+            const float m = bits_per_prob == 8 ? 255.0f : 65535.0f;
+            stats->has_nan = r.any_nan;
+            if (r.k_min <= r.k_max) {
+                stats->min_value = static_cast<double>(static_cast<float>(r.k_min) / m);
+                stats->max_value = static_cast<double>(static_cast<float>(r.k_max) / m);
+            } else {
+                stats->min_value = std::numeric_limits<double>::infinity();
+                stats->max_value = -std::numeric_limits<double>::infinity();
+            }
+            stats->valid = true;
+        }
+        return;
+    }
+
+    // 32-bit: scalar, one sample at a time.
     for (uint32_t i = 0; i < n_samples; ++i) {
         // Read missing status for this sample
         uint8_t ploidy_missing = missing_data_ptr[i];
@@ -582,7 +604,11 @@ void GenotypeParser::compute_dosages_v11_typed(const uint8_t* buffer, size_t siz
 template <typename T>
 void GenotypeParser::compute_dosages_direct_impl(const uint8_t* buffer, size_t size, LayoutType layout,
                                               CompressionType compression, uint32_t n_samples,
-                                              uint16_t n_alleles, T* output) {
+                                              uint16_t n_alleles, T* output,
+                                              ColumnStats* stats) {
+    if (stats) {
+        stats->valid = false;
+    }
     if (compression != CompressionType::None) {
         throw std::runtime_error(
             "Compressed genotype data should be decompressed before computing dosages");
@@ -592,7 +618,7 @@ void GenotypeParser::compute_dosages_direct_impl(const uint8_t* buffer, size_t s
         compute_dosages_v11_typed(buffer, size, n_samples, output);
     } else if (layout == LayoutType::V12) {
         try {
-            compute_dosages_v12_direct<T>(buffer, size, n_samples, n_alleles, output);
+            compute_dosages_v12_direct<T>(buffer, size, n_samples, n_alleles, output, stats);
         } catch (const std::runtime_error& e) {
             // Some BGEN files have V1.2 headers but V1.1 genotype blocks
             // If V1.2 parsing fails, try V1.1 format
@@ -617,15 +643,16 @@ void GenotypeParser::compute_dosages_direct_impl(const uint8_t* buffer, size_t s
 
 void GenotypeParser::compute_dosages_direct(const uint8_t* buffer, size_t size, LayoutType layout,
                                           CompressionType compression, uint32_t n_samples,
-                                          uint16_t n_alleles, float* output) {
-    compute_dosages_direct_impl<float>(buffer, size, layout, compression, n_samples, n_alleles, output);
+                                          uint16_t n_alleles, float* output, ColumnStats* stats) {
+    compute_dosages_direct_impl<float>(buffer, size, layout, compression, n_samples, n_alleles, output,
+                                       stats);
 }
 
 void GenotypeParser::compute_dosages_direct(const uint8_t* buffer, size_t size, LayoutType layout,
                                           CompressionType compression, uint32_t n_samples,
-                                          uint16_t n_alleles, double* output) {
+                                          uint16_t n_alleles, double* output, ColumnStats* stats) {
     compute_dosages_direct_impl<double>(buffer, size, layout, compression, n_samples, n_alleles,
-                                     output);
+                                        output, stats);
 }
 
 void GenotypeParser::compute_dosages_filtered(const uint8_t* buffer, size_t size, LayoutType layout,
@@ -653,10 +680,10 @@ template uint32_t GenotypeParser::read_le<uint32_t>(const uint8_t*);
 // the impl pulls in compute_dosages_v12_direct<T> and compute_dosages_v12_phased<T>.
 template void GenotypeParser::compute_dosages_direct_impl<float>(const uint8_t*, size_t, LayoutType,
                                                              CompressionType, uint32_t, uint16_t,
-                                                             float*);
+                                                             float*, ColumnStats*);
 template void GenotypeParser::compute_dosages_direct_impl<double>(const uint8_t*, size_t, LayoutType,
                                                               CompressionType, uint32_t, uint16_t,
-                                                              double*);
+                                                              double*, ColumnStats*);
 
 }  // namespace bgen
 }  // namespace lazybgen

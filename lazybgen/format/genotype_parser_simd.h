@@ -53,6 +53,40 @@ void compute_dosages_filtered_simd(const uint8_t* prob_data, float* output,
  */
 void compute_dosages_v11_simd(const uint8_t* buffer, size_t n_samples, float* output);
 
+/**
+ * Range of the integer dosage numerators a fused full-sample kernel saw.
+ *
+ * For unphased v1.2 data with b bits per probability and M = 2^b - 1, a valid
+ * sample's dosage is float(k) / M with k = 2*M - 2*P(AA) - P(AB), an integer.
+ * Correctly rounded division is monotone in k, so the column's min and max
+ * dosage are float(k_min) / M and float(k_max) / M exactly, and the kernels
+ * track k instead of rereading the decoded column. k_min > k_max means no
+ * sample was valid; any_nan reports a missing call or an invalid sum.
+ */
+struct NumeratorRange {
+    uint32_t k_min;
+    uint32_t k_max;
+    bool any_nan;
+};
+
+/**
+ * Decode all n samples of an unphased 8-bit (or 16-bit) v1.2 probability block
+ * into dosages, and return the numerator range in the same pass.
+ *
+ * Output is bitwise what decode_dosage_8bit / decode_dosage_16bit produce: a
+ * missing call (bit 7 of its ploidy byte) or an invalid sum decodes to
+ * static_cast<T>(std::nanf("")), and a double column is the exact widening of
+ * the float result. Uses AVX2 when the CPU has it, NEON on AArch64, and a
+ * branch-free scalar loop otherwise. The caller has already checked that
+ * missing holds n bytes and prob holds n pairs.
+ */
+template <typename T>
+NumeratorRange decode_v12_unphased_8bit(const uint8_t* missing, const uint8_t* prob, size_t n,
+                                        T* output);
+template <typename T>
+NumeratorRange decode_v12_unphased_16bit(const uint8_t* missing, const uint8_t* prob, size_t n,
+                                         T* output);
+
 }  // namespace simd
 
 }  // namespace bgen

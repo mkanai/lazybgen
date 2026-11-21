@@ -865,10 +865,15 @@ class BgenReaderImpl::Impl {
                 // Data is already decompressed; pass the format-layer
                 // CompressionType::None (distinct from decompress::).
                 T* column = out + i * out_stride;
+                ::lazybgen::bgen::ColumnStats fused;
                 ::lazybgen::bgen::GenotypeParser::compute_dosages_direct(
                     buf, size, layout, ::lazybgen::bgen::CompressionType::None, n_samples,
-                    j.n_alleles, column);
-                per_variant[i] = scan_dosages(column, n_samples);
+                    j.n_alleles, column, &fused);
+                // The 8/16-bit kernels return the range with the decode; only
+                // the other layouts need a second pass over the column.
+                per_variant[i] = fused.valid
+                                     ? DosageStats{fused.min_value, fused.max_value, fused.has_nan}
+                                     : scan_dosages(column, n_samples);
             },
             out_stride * sizeof(T));
         last_block_stats_ = combine_dosage_stats(per_variant);
