@@ -36,30 +36,20 @@ def _s4(x):
     return struct.pack("<I", len(x)) + x.encode()
 
 
-def _write_v12(path, columns, bits):
+def _write_v12(path, columns, bits, compress=zlib.compress):
     """Write a zlib-compressed layout-2 BGEN with one variant per column.
 
     Each column is (aa, ab, missing): integer arrays of the stored P(AA) and
     P(AB) and a boolean missing flag per sample. Also writes the .bgi index.
     """
     n = len(columns[0][0])
-    samples = [f"s{i}" for i in range(n)]
-    ids = b"".join(_s2(s) for s in samples)
-    sample_block = struct.pack("<II", 8 + len(ids), n) + ids
-    flags = 1 | (2 << 2) | (1 << 31)  # zlib, layout 2, sample IDs present
-    header = struct.pack("<II", len(columns), n) + b"bgen" + struct.pack("<I", flags)
-    header_length = 4 + len(header)  # L_H counts its own 4 bytes
-    prefix = struct.pack("<II", header_length + len(sample_block), header_length) + header
-
-    rows = []
-    body = bytearray()
-    start = len(prefix) + len(sample_block)
+    blocks = []
     word = "<B" if bits == 8 else "<H"
     for v, (aa, ab, miss) in enumerate(columns):
         ploidy = bytes(0x82 if m else 0x02 for m in miss)
         probs = b"".join(struct.pack(word, int(a)) + struct.pack(word, int(b)) for a, b in zip(aa, ab))
         geno = struct.pack("<IHBB", n, 2, 2, 2) + ploidy + struct.pack("<BB", 0, bits) + probs
-        packed = zlib.compress(geno)
+        packed = compress(geno)
         pos = 1000 + v
         block = (
             _s2(f"v{v}")
@@ -71,7 +61,28 @@ def _write_v12(path, columns, bits):
             + struct.pack("<II", len(packed) + 4, len(geno))
             + packed
         )
-        rows.append(("01", pos, f"rs{v}", 2, "A", "G", start + len(body), len(block)))
+        blocks.append((pos, f"rs{v}", block))
+    _write_file(path, n, layout=2, blocks=blocks)
+
+
+def _write_file(path, n, layout, blocks):
+    """Lay out a zlib-compressed BGEN with embedded sample IDs, plus its .bgi.
+
+    blocks is a list of (position, rsid, variant block bytes) in file order.
+    """
+    samples = [f"s{i}" for i in range(n)]
+    ids = b"".join(_s2(s) for s in samples)
+    sample_block = struct.pack("<II", 8 + len(ids), n) + ids
+    flags = 1 | (layout << 2) | (1 << 31)  # zlib, the layout, sample IDs present
+    header = struct.pack("<II", len(blocks), n) + b"bgen" + struct.pack("<I", flags)
+    header_length = 4 + len(header)  # L_H counts its own 4 bytes
+    prefix = struct.pack("<II", header_length + len(sample_block), header_length) + header
+
+    rows = []
+    body = bytearray()
+    start = len(prefix) + len(sample_block)
+    for pos, rsid, block in blocks:
+        rows.append(("01", pos, rsid, 2, "A", "G", start + len(body), len(block)))
         body += block
 
     with open(path, "wb") as f:

@@ -21,11 +21,8 @@ FIXTURES = [
     "example.16bits.zstd.bgen",
     "example.32bits.bgen",
     "data.bgen",
+    "example.v11.bgen",
 ]
-# example.v11.bgen is left out on purpose: the v1.1 filtered path rounds
-# float(ab/sum) + 2*float(bb/sum) while the full path rounds (ab + 2*bb)/sum, a
-# separate known difference (and the spec scales by 1/32768 rather than by the
-# per-sample sum), to be settled on its own.
 
 
 def _selections(n):

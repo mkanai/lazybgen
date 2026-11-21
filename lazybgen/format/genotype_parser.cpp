@@ -86,11 +86,11 @@ std::unique_ptr<GenotypeData> GenotypeParser::parse_v11(const uint8_t* buffer, s
             data->probabilities[i * 3 + 2] = 0.0f;
         } else {
             data->missing[i] = false;
-            // Convert from 16-bit to float probabilities
-            float sum = static_cast<float>(prob_aa + prob_ab + prob_bb);
-            data->probabilities[i * 3] = prob_aa / sum;
-            data->probabilities[i * 3 + 1] = prob_ab / sum;
-            data->probabilities[i * 3 + 2] = prob_bb / sum;
+            // The spec scales each stored integer by 1/32768 (exact: a power of
+            // two); the three need not sum to exactly 1.
+            data->probabilities[i * 3] = prob_aa * kV11Scale;
+            data->probabilities[i * 3 + 1] = prob_ab * kV11Scale;
+            data->probabilities[i * 3 + 2] = prob_bb * kV11Scale;
         }
     }
 
@@ -152,14 +152,7 @@ void GenotypeParser::compute_dosages_v11_direct(const uint8_t* buffer, size_t si
         uint16_t prob_bb = read_le<uint16_t>(ptr);
         ptr += 2;
 
-        // Check for missing data
-        if (prob_aa == 0 && prob_ab == 0 && prob_bb == 0) {
-            output[i] = std::nanf("");
-        } else {
-            // Compute dosage directly
-            float sum = static_cast<float>(prob_aa + prob_ab + prob_bb);
-            output[i] = (prob_ab + 2.0f * prob_bb) / sum;
-        }
+        output[i] = decode_dosage_v11(prob_aa, prob_ab, prob_bb);
     }
 }
 
@@ -666,7 +659,25 @@ void GenotypeParser::compute_dosages_filtered(const uint8_t* buffer, size_t size
         return;
     }
 
-    // For v1.1 or compressed data, fall back to full parsing
+    // v1.1: decode only the requested samples, with the same per-sample kernel
+    // as the full path, so a filtered read is bitwise the full read.
+    if (layout == LayoutType::V11 && compression == CompressionType::None) {
+        if (size < static_cast<size_t>(n_samples) * 6) {
+            throw std::runtime_error("Buffer too small for v1.1 genotype data");
+        }
+        for (int i = 0; i < n_indices; ++i) {
+            const int idx = sample_indices[i];
+            if (idx < 0 || static_cast<uint32_t>(idx) >= n_samples) {
+                throw std::runtime_error("Sample index out of bounds");
+            }
+            const uint8_t* p = buffer + static_cast<size_t>(idx) * 6;
+            output[i] = decode_dosage_v11(read_le<uint16_t>(p), read_le<uint16_t>(p + 2),
+                                          read_le<uint16_t>(p + 4));
+        }
+        return;
+    }
+
+    // Anything else falls back to full parsing
     // (compressed data should already be decompressed before reaching here)
     auto data = parse(buffer, size, layout, compression, n_samples, n_alleles);
     data->extract_dosages_filtered(sample_indices, n_indices, output);

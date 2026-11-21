@@ -60,6 +60,21 @@ inline T decode_dosage_32bit(uint32_t prob_aa, uint32_t prob_ab) {
     return static_cast<T>(static_cast<float>(dosage));
 }
 
+// BGEN v1.1 (layout 1) stores P(AA), P(AB) and P(BB) as 16-bit integers that
+// the spec converts to probabilities by dividing by 32768; all three zero
+// marks a missing call. The dosage is therefore (P(AB) + 2*P(BB)) / 32768.
+// The numerator is an integer below 2^18 and 32768 is a power of two, so the
+// float result is exact, and every v1.1 path (full, filtered, SIMD lanes and
+// scalar tails, float and double) produces the same bits.
+constexpr float kV11Scale = 1.0f / 32768.0f;
+
+inline float decode_dosage_v11(uint16_t prob_aa, uint16_t prob_ab, uint16_t prob_bb) {
+    if ((prob_aa | prob_ab | prob_bb) == 0) {
+        return std::nanf("");
+    }
+    return static_cast<float>(static_cast<uint32_t>(prob_ab) + 2u * prob_bb) * kV11Scale;
+}
+
 // Structure to hold genotype data
 struct GenotypeData {
     uint32_t n_samples;

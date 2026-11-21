@@ -465,7 +465,7 @@ static void compute_dosages_filtered_32bit_simd(const uint8_t* prob_data, float*
 LAZYBGEN_TARGET_AVX2 static size_t v11_avx2(const uint8_t* buffer, size_t n_samples, float* output,
                                             size_t i) {
     // Process 8 samples at a time with AVX2
-    const __m256 two = _mm256_set1_ps(2.0f);
+    const __m256 scale = _mm256_set1_ps(kV11Scale);
 
     for (; i + 7 < n_samples; i += 8) {
         // Load 48 bytes (8 samples × 6 bytes)
@@ -494,16 +494,10 @@ LAZYBGEN_TARGET_AVX2 static size_t v11_avx2(const uint8_t* buffer, size_t n_samp
         __m256i sum_check = _mm256_or_si256(_mm256_or_si256(prob_aa, prob_ab), prob_bb);
         __m256i is_missing_mask = _mm256_cmpeq_epi32(sum_check, _mm256_setzero_si256());
 
-        // Calculate sum for normalization
-        __m256i sum = _mm256_add_epi32(_mm256_add_epi32(prob_aa, prob_ab), prob_bb);
-
-        // Convert to float for division
-        __m256 sum_f = _mm256_cvtepi32_ps(sum);
-        __m256 prob_ab_f = _mm256_cvtepi32_ps(prob_ab);
-        __m256 prob_bb_f = _mm256_cvtepi32_ps(prob_bb);
-
-        // Calculate dosage = (prob_ab + 2 * prob_bb) / sum
-        __m256 dosage = _mm256_div_ps(_mm256_fmadd_ps(two, prob_bb_f, prob_ab_f), sum_f);
+        // dosage = (prob_ab + 2 * prob_bb) / 32768, as decode_dosage_v11: the
+        // integer numerator converts exactly and the scale is a power of two.
+        __m256i num = _mm256_add_epi32(prob_ab, _mm256_add_epi32(prob_bb, prob_bb));
+        __m256 dosage = _mm256_mul_ps(_mm256_cvtepi32_ps(num), scale);
 
         // Create NaN mask for missing values
         __m256 nan_val = _mm256_set1_ps(std::nanf(""));
@@ -525,7 +519,7 @@ void compute_dosages_v11_simd(const uint8_t* buffer, size_t n_samples, float* ou
 #elif defined(__aarch64__)
     if (g_has_neon) {
         // Process 4 samples at a time with NEON
-        const float32x4_t two = vdupq_n_f32(2.0f);
+        const float32x4_t scale = vdupq_n_f32(kV11Scale);
 
         for (; i + 3 < n_samples; i += 4) {
             // Load P(AA), P(AB), and P(BB) for 4 samples
@@ -544,21 +538,9 @@ void compute_dosages_v11_simd(const uint8_t* buffer, size_t n_samples, float* ou
             uint16x4_t sum_check = vorr_u16(vorr_u16(prob_aa, prob_ab), prob_bb);
             uint16x4_t is_missing = vceq_u16(sum_check, vdup_n_u16(0));
 
-            // Convert to 32-bit for calculation
-            uint32x4_t prob_aa_32 = vmovl_u16(prob_aa);
-            uint32x4_t prob_ab_32 = vmovl_u16(prob_ab);
-            uint32x4_t prob_bb_32 = vmovl_u16(prob_bb);
-
-            // Calculate sum
-            uint32x4_t sum = vaddq_u32(vaddq_u32(prob_aa_32, prob_ab_32), prob_bb_32);
-
-            // Convert to float
-            float32x4_t sum_f = vcvtq_f32_u32(sum);
-            float32x4_t prob_ab_f = vcvtq_f32_u32(prob_ab_32);
-            float32x4_t prob_bb_f = vcvtq_f32_u32(prob_bb_32);
-
-            // Calculate dosage = (prob_ab + 2 * prob_bb) / sum
-            float32x4_t dosage = vdivq_f32(vmlaq_f32(prob_ab_f, two, prob_bb_f), sum_f);
+            // dosage = (prob_ab + 2 * prob_bb) / 32768, as decode_dosage_v11.
+            uint32x4_t num = vaddw_u16(vshll_n_u16(prob_bb, 1), prob_ab);
+            float32x4_t dosage = vmulq_f32(vcvtq_f32_u32(num), scale);
 
             // Store results with missing handling
             float result[4];
@@ -582,14 +564,7 @@ void compute_dosages_v11_simd(const uint8_t* buffer, size_t n_samples, float* ou
         uint16_t prob_ab = read_le16(buffer + i * 6 + 2);
         uint16_t prob_bb = read_le16(buffer + i * 6 + 4);
 
-        // Check for missing data
-        if (prob_aa == 0 && prob_ab == 0 && prob_bb == 0) {
-            output[i] = std::nanf("");
-        } else {
-            // Compute dosage directly
-            float sum = static_cast<float>(prob_aa + prob_ab + prob_bb);
-            output[i] = (prob_ab + 2.0f * prob_bb) / sum;
-        }
+        output[i] = decode_dosage_v11(prob_aa, prob_ab, prob_bb);
     }
 }
 
