@@ -34,7 +34,8 @@ cd lazybgen
 pip install .
 ```
 
-Building from source requires a C/C++ compiler (CMake is needed on Windows only).
+Building from source requires a C/C++ compiler on Linux or macOS. Windows is not
+supported.
 The vendored `libdeflate` and `zstd` are git submodules, so clone with `--recursive`
 (or run `git submodule update --init --recursive`).
 
@@ -92,8 +93,8 @@ A `.bgi` index is required; create one with `bgenix -g file.bgen`.
 - `nan_action`: how to handle missing dosages: `"error"` (default, raise),
   `"mean"` (impute with the per-variant mean), `"omit"` (drop affected samples),
   or `"warn"` (keep NaNs and log a warning)
-- `num_threads`: worker threads for decoding. `0` (default) uses one per CPU the
-  process may run on and decodes blocks in parallel; `1` forces single-threaded decoding;
+- `num_threads`: worker threads for decoding. `0` (default) decodes blocks in parallel
+  with one worker per CPU the job may use; `1` forces single-threaded decoding;
   `N > 1` uses N threads (see [Parallel decode](#parallel-decode))
 - `storage_options`: cloud backend kwargs, in fsspec spelling whichever transport
   serves them (e.g. `{"anon": True}` for public S3, `{"requester_pays": True}` to
@@ -125,10 +126,12 @@ v1.2 / v1.3 (re-encode with `qctool2` if needed) for production use.
 
 ### Reading many variants
 
-Ask for the variants together rather than one call each. Every call returns a
-variant-info DataFrame, and pandas charges about 100 us to build one whatever its
-row count, so a loop of point lookups spends more time in pandas than in reading.
-For 500 variants the batched forms below are ~17x faster than the loop:
+Ask for the variants together rather than one call each. Every call pays fixed
+costs whatever its row count, building a variant-info DataFrame among them, so a
+loop of point lookups spends more time on those than on reading. For 500
+variants at 5000 samples (with a `.sample` file), one batched call is ~67x
+faster than the `load_bgen` loop below, which also reopens the file each call,
+and ~20x faster than the same loop over one open `BgenReader`:
 
 ```python
 from lazybgen import load_bgen
@@ -169,9 +172,10 @@ from a `.z` file if your variants come from one.
 ### Memory
 
 A local file is memory-mapped and read in place, so the compressed bytes are
-never copied on the way and a read costs about the matrix it returns. lazybgen
-peaks around 1.2x the `bgen` package for the same read (9.7 GB against 7.8 GB for
-a 2000-variant region at 500k samples).
+never copied on the way and a read costs about the matrix it returns. At biobank
+scale lazybgen peaks around 1.25x the `bgen` package for the same float64 output
+(9.4 GiB against 7.5 GiB for a 2000-variant region at 500k samples); at small
+sample counts fixed overhead makes the ratio larger.
 
 Ask for `float32` when single precision is enough. Dosages are computed in single
 precision either way, so a `float64` result is the exact widening of the same
@@ -183,8 +187,9 @@ import numpy as np
 genotypes, _, _ = load_bgen("chr1.bgen", region="chr1:1-1000000", dtype=np.float32)
 ```
 
-To avoid materializing the matrix at all, stream it: `iter_variants` is
-`O(n_samples x block_size)` whatever the file holds (see
+To avoid materializing the matrix at all, stream it: `iter_variants` holds
+`O(n_samples x block_size)` dosages whatever the file holds, plus the selected
+variants' index records, which it resolves up front (see
 [Streaming large files](#streaming-large-files)).
 
 ### Streaming large files
@@ -215,17 +220,21 @@ Decoding runs in parallel across CPU cores by default: each block is inflated an
 decoded across worker threads, byte-identical to single-threaded decoding. This
 applies to `load_bgen`, `BgenReader.load_variants`, and `iter_variants`, for both
 all-samples and sample-filtered (cohort) reads, and scales with the sample and
-core count: on a 16-core machine at 100k samples, a full decode is 6.8x faster
-than `num_threads=1` and a 2000-variant region 6.6x.
+core count: on a 16 vCPU machine at 100k samples, a full decode with the default
+is 12x faster than with `num_threads=1`, which also takes a slower serial path,
+and a 2000-variant region 12x.
 
-Control the worker count with `num_threads`: `0` (default) starts one worker per
-CPU the process may use, `1` forces single-threaded decoding, and `N > 1` uses N
-threads. On Linux the default follows the process's CPU affinity and any cgroup
-CPU quota, so a SLURM job, `taskset`, or a container limited to 4 CPUs gets 4
-workers, not one per core of the machine.
+Control the worker count with `num_threads`: `0` (default) starts up to one worker
+per CPU the job may use (never more than the block has variants), `1` forces
+single-threaded decoding, and `N > 1` uses up to N threads. On Linux the default follows
+the CPU affinity of the decoding thread, read at each decode, capped by the
+tightest cgroup CPU quota on the process's cgroup or its ancestors (read once per
+process, rounded up), so a SLURM job, `taskset`, or a container limited to 4 CPUs
+gets 4 workers, not one per core of the machine. Elsewhere it is the machine's
+core count.
 
 ```python
-# Parallel by default (auto-detected cores)
+# Parallel by default (one worker per CPU the job may use)
 genotypes, variant_info, sample_ids = load_bgen("chr1.bgen")
 
 # Force single-threaded decoding
@@ -281,14 +290,18 @@ was built against (vendored libdeflate / zstd, or system libraries).
 ## Performance
 
 Against the [`bgen`](https://pypi.org/project/bgen/) package on the same local
-files, 10k variants and samples scaling to biobank size (16 vCPU n2 VM, median of
-3 warm runs, lazybgen's wall time in parentheses):
+files, 10k variants and samples scaling to biobank size (lazybgen 0.3.0, 16 vCPU
+n2 VM, median of 3 warm runs averaged over two rounds, lazybgen's wall time in
+parentheses):
 
-| Workload                  | 5k samples (94 MB) | 50k (931 MB)   | 500k (9.1 GB)  |
+| Workload                  | 5k samples (94 MiB) | 50k (931 MiB) | 500k (9.1 GiB) |
 |---------------------------|--------------------|----------------|----------------|
-| Full decode               | 10.7x (75 ms)      | 15.3x (483 ms) | 15.5x (4.80 s) |
-| Region (2000 variants)    | 8.8x (18 ms)       | 15.3x (99 ms)  | 16.5x (961 ms) |
-| Scattered (1000 variants) | 6.0x (15 ms)       | 13.5x (57 ms)  | 15.5x (501 ms) |
+| Full decode               | 12.5x (68 ms)      | 21.7x (372 ms) | 22.7x (3.42 s) |
+| Region (2000 variants)    | 10.6x (17 ms)      | 21.1x (77 ms)  | 22.5x (697 ms) |
+| Scattered (1000 variants) | 6.8x (15 ms)       | 18.1x (46 ms)  | 21.9x (366 ms) |
+
+On these reads 0.3.0 is 1.1-1.2x faster than 0.2.0 at 5k samples and 1.3-1.4x
+from 50k up.
 
 ### Remote: lazy partial reads at biobank scale
 
@@ -296,30 +309,34 @@ This is the point of the package. A local-only reader must download the whole fi
 before reading a byte, so its cost tracks file size; lazybgen fetches only the
 variants you ask for, so its cost tracks the slice and **does not grow with the
 file**. Each cell is the end-to-end speedup over downloading the file first
-(whole-file `gcloud storage cp` + a local read), with that baseline in
-parentheses:
+(whole-file `gcloud storage cp`, then the same read from the local copy with
+lazybgen), with that baseline in parentheses (same-region bucket, 16 vCPU VM;
+these reads are bound by the network, not the decode):
 
-| Read (500k samples)       | lazybgen `gs://` | 10k var (9.1 GB) | 50k var (45 GB) | 100k var (91 GB) |
+| Read (500k samples)       | lazybgen `gs://` | 10k var (9.1 GiB) | 50k var (45 GiB) | 100k var (91 GiB) |
 |---------------------------|------------------|------------------|-----------------|------------------|
-| One variant               | **341 ms**       | ~15x (5.2 s)     | ~76x (26 s)     | ~151x (52 s)     |
-| Region (2000 contiguous)  | **5.93 s**       | 0.9x (5.2 s)     | ~4x (26 s)      | ~9x (52 s)       |
-| Scattered (1000 random)   | **3.12 s**       | ~2x (5.2 s)      | ~8x (26 s)      | ~17x (52 s)      |
+| One variant               | **0.37 s**       | ~22x (8.3 s)     | ~112x (41 s)    | ~224x (83 s)     |
+| Region (2000 contiguous)  | **6.79 s**       | 1.3x (9.0 s)     | ~6x (42 s)      | ~12x (84 s)      |
+| Scattered (1000 random)   | **3.79 s**       | ~2x (8.7 s)      | ~11x (42 s)     | ~22x (83 s)      |
 
-Only the 9.1 GB download is measured (5.2 s, median of 5); the 26 s and 52 s
+Only the 9.1 GiB download is measured (8.3 s, median of 5); the 45 and 91 GiB
 figures scale it by byte size, since download time depends on bytes and not on
-what is in them.
+what is in them. The lazybgen times are medians of 10 reads.
 
 The lazybgen column is one number per row because it does not change with the
-file: the same read costs the same at 10k variants and at 100k. The 0.9x is the
+file: the same read costs the same at 10k variants and at 100k. The 1.3x is the
 honest edge of that: at 10k variants a 2000-variant region is a fifth of the file,
-and fetching a fifth of an object costs about what fetching all of it does on a
+and fetching a fifth of an object costs nearly what fetching all of it does on a
 fast same-region link. Partial reads pay when the slice is genuinely a slice,
 which is the regime biobank-scale files are in. The baseline is also best-case
 for the download - same-region, free egress, and not very repeatable run to run -
-so a laptop, cross-region or metered link widens every gap.
+so a laptop, cross-region or metered link widens every gap. The ratios are
+higher than the 0.2.0 README's because the download measured slower that day,
+not because lazybgen's remote reads got faster.
 
-These are single batched reads. A loop of one-variant calls is ~17x slower for
-the same variants, and a read costs about the matrix it returns; see
+These are single batched reads. A loop of one-variant calls is slower for the
+same variants (~20x locally, even on one open reader), and a read costs about
+the matrix it returns; see
 [Reading many variants](#reading-many-variants) and [Memory](#memory).
 
 [benchmarks/README.md](benchmarks/README.md#lazybgen-vs-the-bgen-package) has the
