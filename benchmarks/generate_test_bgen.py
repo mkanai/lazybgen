@@ -146,7 +146,8 @@ def get_test_configurations(mode="standard"):
     """Get test configurations based on mode.
 
     Args:
-        mode: One of 'quick', 'standard', 'comprehensive', 'compression', 'scaling'
+        mode: One of 'quick', 'standard', 'comprehensive', 'compression', 'scaling',
+            'large', 'upscale', 'ladder'
 
     Returns:
         List of configuration dictionaries
@@ -211,8 +212,17 @@ def get_test_configurations(mode="standard"):
         {"name": "enc_zstd", "n_samples": 100000, "n_variants": 2000, "use_zstd": True, "bit_depth": 8},
     ]
 
+    # The compare_libraries.py ladder: 10k variants, 500 to 500k samples. The
+    # published local tables are measured on exactly these seven files.
+    ladder_configs = [
+        {"name": f"ladder_{n}", "n_samples": n, "n_variants": 10000, "compression": "zlib", "bit_depth": 8}
+        for n in (500, 1000, 5000, 10000, 50000, 100000, 500000)
+    ]
+
     # Select configurations based on mode
-    if mode == "quick":
+    if mode == "ladder":
+        configs = ladder_configs
+    elif mode == "quick":
         # Only tiny, small, and medium for quick testing
         configs = [c for c in core_configs if c["name"] in ["tiny", "small", "medium"]]
     elif mode == "standard":
@@ -246,7 +256,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate test BGEN files for benchmarking")
     parser.add_argument(
         "--mode",
-        choices=["quick", "standard", "comprehensive", "compression", "scaling", "large", "upscale"],
+        choices=["quick", "standard", "comprehensive", "compression", "scaling", "large", "upscale", "ladder"],
         default="standard",
         help="Test generation mode",
     )
