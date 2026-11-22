@@ -1162,6 +1162,11 @@ def test_samples_available_after_close(test_paths):
     reader.close()
     assert len(reader.samples) == reader.nsamples
 
+    # A file carrying its own IDs, closed before anyone asked for them.
+    with BgenReader(str(test_paths["bgen_file"].parent / "example.8bits.bgen")) as reader:
+        reader.load_variants()
+    assert reader.samples == [f"sample_{i:03d}" for i in range(1, reader.nsamples + 1)]
+
 
 def test_samples_are_cached(test_paths):
     """Repeated access returns the same materialized list, not a fresh parse."""

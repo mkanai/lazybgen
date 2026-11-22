@@ -91,11 +91,23 @@ CompressionResult decompress_zlib(const uint8_t* compressed, size_t compressed_s
                                                   output_size, &bytes_written)
                      : libdeflate_deflate_decompress(decompressor, compressed, compressed_size,
                                                      output, output_size, &bytes_written);
-    if (zlib_wrapped && result == LIBDEFLATE_BAD_DATA) {
+    if (zlib_wrapped && (result != LIBDEFLATE_SUCCESS || bytes_written != output_size)) {
         // A raw deflate stream can begin with bytes that happen to form a valid
-        // zlib header; read it the way it was read before the header check.
-        result = libdeflate_deflate_decompress(decompressor, compressed, compressed_size, output,
-                                               output_size, &bytes_written);
+        // zlib header (a non-final stored block starting 0x08). Read as zlib, such
+        // a stream fails or comes up short, so read it as raw deflate, the way it
+        // was read before the header check, and keep that result only when it
+        // yields exactly the declared size.
+        size_t raw_written = 0;
+        const enum libdeflate_result raw = libdeflate_deflate_decompress(
+            decompressor, compressed, compressed_size, output, output_size, &raw_written);
+        if (raw == LIBDEFLATE_SUCCESS && raw_written == output_size) {
+            result = raw;
+            bytes_written = raw_written;
+        } else if (result == LIBDEFLATE_SUCCESS) {
+            // The zlib read succeeded short; redo it so the caller sees its bytes.
+            result = libdeflate_zlib_decompress(decompressor, compressed, compressed_size, output,
+                                                output_size, &bytes_written);
+        }
     }
 
     if (result == LIBDEFLATE_SUCCESS) {

@@ -129,6 +129,7 @@ cdef extern from "format/genotype_parser.h" namespace "lazybgen::bgen":
 # Main BGEN reader class
 cdef extern from "bgen_reader_impl.h" namespace "lazybgen::io::bgen":
     size_t default_num_threads()
+    size_t cgroup_cpu_limit_from(const string& mountinfo_path, const string& cgroup_path, const string& prefix)
 
 cdef extern from "bgen_reader_impl.h" namespace "lazybgen::io::bgen":
     cdef struct DosageStats:
@@ -177,6 +178,7 @@ cdef extern from "bgen_reader_impl.h" namespace "lazybgen::io::bgen":
         # File info
         bool is_open() except +
         void close() except +
+        void discard_embedded_sample_ids() except +
 
 # Cython wrapper classes
 cdef class BgenReader:

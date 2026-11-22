@@ -1,7 +1,9 @@
 #include "genotype_parser_simd.h"
 
 #include <algorithm>
+#include <cfenv>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -36,6 +38,14 @@ static void detect_cpu_features() {
         // ARM NEON is always available on AArch64
         g_has_neon = true;
 #endif
+        // LAZYBGEN_DISABLE_SIMD=1 forces the baseline kernels, so the code a CPU
+        // without AVX2 runs can be tested on one that has it (and the scalar
+        // paths on AArch64). Read once, before the first decode.
+        const char* off = std::getenv("LAZYBGEN_DISABLE_SIMD");
+        if (off && *off && std::strcmp(off, "0") != 0) {
+            g_has_avx2 = false;
+            g_has_neon = false;
+        }
     });
 }
 
@@ -109,7 +119,7 @@ LAZYBGEN_TARGET_AVX2 static size_t filtered_8bit_avx2(const uint8_t* prob_data, 
         bool is_missing[8] = {false};
 
         for (int j = 0; j < 8; ++j) {
-            int idx = sample_indices[i + j];
+            const size_t idx = static_cast<size_t>(sample_indices[i + j]);
             prob_aa[j] = prob_data[idx * 2];
             prob_ab[j] = prob_data[idx * 2 + 1];
 
@@ -180,7 +190,7 @@ static void compute_dosages_filtered_8bit_simd(const uint8_t* prob_data, float* 
             bool is_missing[4] = {false};
 
             for (int j = 0; j < 4; ++j) {
-                int idx = sample_indices[i + j];
+                const size_t idx = static_cast<size_t>(sample_indices[i + j]);
                 prob_aa[j] = prob_data[idx * 2];
                 prob_ab[j] = prob_data[idx * 2 + 1];
 
@@ -223,7 +233,7 @@ static void compute_dosages_filtered_8bit_simd(const uint8_t* prob_data, float* 
 
     // Scalar fallback for remaining samples
     for (; i < n_indices; ++i) {
-        int idx = sample_indices[i];
+        const size_t idx = static_cast<size_t>(sample_indices[i]);
 
         // Check if missing
         bool is_missing = false;
@@ -257,7 +267,7 @@ LAZYBGEN_TARGET_AVX2 static size_t filtered_16bit_avx2(const uint8_t* prob_data,
         // Gather data for 8 selected samples
         uint32_t prob_aa_arr[8], prob_ab_arr[8];
         for (int j = 0; j < 8; ++j) {
-            int idx = sample_indices[i + j];
+            const size_t idx = static_cast<size_t>(sample_indices[i + j]);
             prob_aa_arr[j] = read_le16(prob_data + idx * 4);
             prob_ab_arr[j] = read_le16(prob_data + idx * 4 + 2);
         }
@@ -287,7 +297,7 @@ LAZYBGEN_TARGET_AVX2 static size_t filtered_16bit_avx2(const uint8_t* prob_data,
         // an invalid probability sum (prob_aa + prob_ab > 65535) decode to
         // NaN.
         for (int j = 0; j < 8; ++j) {
-            int idx = sample_indices[i + j];
+            const size_t idx = static_cast<size_t>(sample_indices[i + j]);
             bool is_missing = missing_mask && (missing_mask[idx] & 0x80) != 0;
             if (is_missing || (prob_aa_arr[j] + prob_ab_arr[j] > 65535)) {
                 output[i + j] = std::nanf("");
@@ -320,7 +330,7 @@ static void compute_dosages_filtered_16bit_simd(const uint8_t* prob_data, float*
             // Gather data for 4 selected samples
             uint32_t prob_aa_arr[4], prob_ab_arr[4];
             for (int j = 0; j < 4; ++j) {
-                int idx = sample_indices[i + j];
+                const size_t idx = static_cast<size_t>(sample_indices[i + j]);
                 prob_aa_arr[j] = read_le16(prob_data + idx * 4);
                 prob_ab_arr[j] = read_le16(prob_data + idx * 4 + 2);
             }
@@ -353,7 +363,7 @@ static void compute_dosages_filtered_16bit_simd(const uint8_t* prob_data, float*
             // an invalid probability sum (prob_aa + prob_ab > 65535, which makes
             // the vector chunk's prob_bb wrap as unsigned) decode to NaN.
             for (int j = 0; j < 4; ++j) {
-                int idx = sample_indices[i + j];
+                const size_t idx = static_cast<size_t>(sample_indices[i + j]);
                 bool is_missing = missing_mask && (missing_mask[idx] & 0x80) != 0;
                 if (is_missing || (prob_aa_arr[j] + prob_ab_arr[j] > 65535)) {
                     output[i + j] = std::nanf("");
@@ -367,7 +377,7 @@ static void compute_dosages_filtered_16bit_simd(const uint8_t* prob_data, float*
 
     // Scalar fallback for remaining samples
     for (; i < n_indices; ++i) {
-        int idx = sample_indices[i];
+        const size_t idx = static_cast<size_t>(sample_indices[i]);
 
         // Check if missing
         bool is_missing = false;
@@ -387,7 +397,9 @@ static void compute_dosages_filtered_16bit_simd(const uint8_t* prob_data, float*
     }
 }
 
-static void compute_dosages_filtered_32bit_simd(const uint8_t* prob_data, float* output,
+// Compiled twice, like the v1.2 direct body: 0.2.x built this scalar double
+// arithmetic with AVX2/FMA everywhere, and the baseline build is slower.
+LAZYBGEN_ALWAYS_INLINE void filtered_32bit_body(const uint8_t* prob_data, float* output,
                                                 const int* sample_indices, size_t n_indices,
                                                 const uint8_t* missing_mask) {
     size_t i = 0;
@@ -399,7 +411,7 @@ static void compute_dosages_filtered_32bit_simd(const uint8_t* prob_data, float*
             // Gather data for 4 selected samples
             uint64_t prob_aa[4], prob_ab[4];
             for (int j = 0; j < 4; ++j) {
-                int idx = sample_indices[i + j];
+                const size_t idx = static_cast<size_t>(sample_indices[i + j]);
                 prob_aa[j] = read_le32(prob_data + idx * 8);
                 prob_ab[j] = read_le32(prob_data + idx * 8 + 4);
             }
@@ -426,7 +438,7 @@ static void compute_dosages_filtered_32bit_simd(const uint8_t* prob_data, float*
             // Handle missing values
             if (missing_mask) {
                 for (int j = 0; j < 4; ++j) {
-                    int idx = sample_indices[i + j];
+                    const size_t idx = static_cast<size_t>(sample_indices[i + j]);
                     // BGEN v1.2/v1.3: one byte per sample, high bit 0x80 = missing.
                     if (missing_mask[idx] & 0x80) {
                         output[i + j] = std::nanf("");
@@ -439,7 +451,7 @@ static void compute_dosages_filtered_32bit_simd(const uint8_t* prob_data, float*
 
     // Scalar fallback (also used for ARM)
     for (; i < n_indices; ++i) {
-        int idx = sample_indices[i];
+        const size_t idx = static_cast<size_t>(sample_indices[i]);
 
         // Check if missing
         bool is_missing = false;
@@ -457,6 +469,26 @@ static void compute_dosages_filtered_32bit_simd(const uint8_t* prob_data, float*
         uint32_t prob_ab = read_le32(prob_data + idx * 8 + 4);
         output[i] = decode_dosage_32bit<float>(prob_aa, prob_ab);
     }
+}
+
+#ifdef LAZYBGEN_X86_AVX2
+LAZYBGEN_TARGET_AVX2 static void filtered_32bit_avx2(const uint8_t* prob_data, float* output,
+                                                     const int* sample_indices, size_t n_indices,
+                                                     const uint8_t* missing_mask) {
+    filtered_32bit_body(prob_data, output, sample_indices, n_indices, missing_mask);
+}
+#endif
+
+static void compute_dosages_filtered_32bit_simd(const uint8_t* prob_data, float* output,
+                                                const int* sample_indices, size_t n_indices,
+                                                const uint8_t* missing_mask) {
+#ifdef LAZYBGEN_X86_AVX2
+    if (g_has_avx2) {
+        filtered_32bit_avx2(prob_data, output, sample_indices, n_indices, missing_mask);
+        return;
+    }
+#endif
+    filtered_32bit_body(prob_data, output, sample_indices, n_indices, missing_mask);
 }
 
 // BGEN v1.1 SIMD implementation
@@ -621,7 +653,9 @@ inline void fused_tail(const uint8_t* missing, const uint8_t* prob, size_t i, si
 }
 
 // float(k) / 255 for every 8-bit numerator, so the scalar path does a load
-// instead of a divide. Built from the same expression, so the values match.
+// instead of a divide. Built from the same expression, so the values match, but
+// only under round-to-nearest: the divide honors the caller's rounding mode and
+// a table cannot, so the caller uses it (and first builds it) only in that mode.
 const float* dosage_lut_8bit() {
     static const struct Table {
         float v[511];
@@ -862,9 +896,12 @@ NumeratorRange decode_v12_unphased_8bit(const uint8_t* missing, const uint8_t* p
         i = fused_8bit_avx2<T>(missing, prob, n, output, r);
     }
 #elif defined(__aarch64__)
-    i = fused_8bit_neon<T>(missing, prob, n, output, r);
+    if (can_use_simd_dosage()) {
+        i = fused_8bit_neon<T>(missing, prob, n, output, r);
+    }
 #endif
-    fused_tail<T, 255u>(missing, prob, i, n, output, dosage_lut_8bit(), r);
+    const float* lut = (i < n && std::fegetround() == FE_TONEAREST) ? dosage_lut_8bit() : nullptr;
+    fused_tail<T, 255u>(missing, prob, i, n, output, lut, r);
     return r;
 }
 
@@ -878,7 +915,9 @@ NumeratorRange decode_v12_unphased_16bit(const uint8_t* missing, const uint8_t* 
         i = fused_16bit_avx2<T>(missing, prob, n, output, r);
     }
 #elif defined(__aarch64__)
-    i = fused_16bit_neon<T>(missing, prob, n, output, r);
+    if (can_use_simd_dosage()) {
+        i = fused_16bit_neon<T>(missing, prob, n, output, r);
+    }
 #endif
     fused_tail<T, 65535u>(missing, prob, i, n, output, nullptr, r);
     return r;

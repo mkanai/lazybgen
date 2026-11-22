@@ -41,7 +41,7 @@ void GenotypeData::extract_dosages_filtered(const int* sample_indices, int n_ind
         if (missing[idx]) {
             output[i] = std::nanf("");
         } else {
-            size_t offset = idx * 3;
+            size_t offset = static_cast<size_t>(idx) * 3;
             output[i] = probabilities[offset + 1] + 2.0f * probabilities[offset + 2];
         }
     }
@@ -59,7 +59,7 @@ std::unique_ptr<GenotypeData> GenotypeParser::parse_v11(const uint8_t* buffer, s
     data->max_ploidy = 2;
 
     // v1.1 format: 6 bytes per sample
-    if (size < n_samples * 6) {
+    if (size < static_cast<size_t>(n_samples) * 6) {
         throw std::runtime_error("Buffer too small for v1.1 genotype data");
     }
 
@@ -129,7 +129,7 @@ std::unique_ptr<GenotypeData> GenotypeParser::parse_decompressed(const uint8_t* 
 
 void GenotypeParser::compute_dosages_v11_direct(const uint8_t* buffer, size_t size, uint32_t n_samples,
                                              float* output) {
-    if (size < n_samples * 6) {
+    if (size < static_cast<size_t>(n_samples) * 6) {
         throw std::runtime_error("Buffer too small for v1.1 genotype data");
     }
 
@@ -303,46 +303,14 @@ LAZYBGEN_ALWAYS_INLINE void GenotypeParser::compute_dosages_v12_direct_body(
         return;
     }
 
-    // 32-bit: scalar, one sample at a time.
-    for (uint32_t i = 0; i < n_samples; ++i) {
-        // Read missing status for this sample
-        uint8_t ploidy_missing = missing_data_ptr[i];
-        bool is_missing = (ploidy_missing & 0x80) != 0;
-
-        if (is_missing) {
-            // Sample is missing - output NaN
+    // 32-bit: scalar, one sample at a time, through the shared kernel (the
+    // single source of truth for the arithmetic and the invalid-sum -> NaN rule).
+    for (uint32_t i = 0; i < n_samples; ++i, prob_ptr += 8) {
+        if (missing_data_ptr[i] & 0x80) {
             output[i] = static_cast<T>(std::nanf(""));
-
-            // Skip probability data for this sample
-            if (bits_per_prob == 8) {
-                prob_ptr += 2;  // Skip 2 bytes (prob_aa, prob_ab)
-            } else if (bits_per_prob == 16) {
-                prob_ptr += 4;  // Skip 4 bytes (2 x uint16_t)
-            } else {            // 32 bits
-                prob_ptr += 8;  // Skip 8 bytes (2 x uint32_t)
-            }
         } else {
-            // Read and compute dosage via the shared scalar kernels (single
-            // source of truth for the (prob_ab + 2*prob_bb)/max arithmetic and
-            // the invalid-sum -> NaN contract).
-            if (bits_per_prob == 8) {
-                uint8_t prob_aa = *prob_ptr++;
-                uint8_t prob_ab = *prob_ptr++;
-                // prob_bb is implicit = 255 - prob_aa - prob_ab
-                output[i] = decode_dosage_8bit<T>(prob_aa, prob_ab);
-            } else if (bits_per_prob == 16) {
-                uint16_t prob_aa = read_le<uint16_t>(prob_ptr);
-                prob_ptr += 2;
-                uint16_t prob_ab = read_le<uint16_t>(prob_ptr);
-                prob_ptr += 2;
-                output[i] = decode_dosage_16bit<T>(prob_aa, prob_ab);
-            } else {  // 32 bits
-                uint32_t prob_aa = read_le<uint32_t>(prob_ptr);
-                prob_ptr += 4;
-                uint32_t prob_ab = read_le<uint32_t>(prob_ptr);
-                prob_ptr += 4;
-                output[i] = decode_dosage_32bit<T>(prob_aa, prob_ab);
-            }
+            output[i] = decode_dosage_32bit<T>(read_le<uint32_t>(prob_ptr),
+                                               read_le<uint32_t>(prob_ptr + 4));
         }
     }
 
@@ -500,21 +468,21 @@ void GenotypeParser::compute_dosages_v12_filtered(const uint8_t* buffer, size_t 
 
         if (bits_per_prob == 8) {
             // 2 bytes per sample
-            sample_prob_ptr += sample_idx * 2;
+            sample_prob_ptr += static_cast<size_t>(sample_idx) * 2;
 
             uint8_t prob_aa = sample_prob_ptr[0];
             uint8_t prob_ab = sample_prob_ptr[1];
             output[idx] = decode_dosage_8bit<float>(prob_aa, prob_ab);
         } else if (bits_per_prob == 16) {
             // 4 bytes per sample
-            sample_prob_ptr += sample_idx * 4;
+            sample_prob_ptr += static_cast<size_t>(sample_idx) * 4;
 
             uint16_t prob_aa = read_le<uint16_t>(sample_prob_ptr);
             uint16_t prob_ab = read_le<uint16_t>(sample_prob_ptr + 2);
             output[idx] = decode_dosage_16bit<float>(prob_aa, prob_ab);
         } else {  // 32 bits
             // 8 bytes per sample
-            sample_prob_ptr += sample_idx * 8;
+            sample_prob_ptr += static_cast<size_t>(sample_idx) * 8;
 
             uint32_t prob_aa = read_le<uint32_t>(sample_prob_ptr);
             uint32_t prob_ab = read_le<uint32_t>(sample_prob_ptr + 4);
@@ -524,10 +492,10 @@ void GenotypeParser::compute_dosages_v12_filtered(const uint8_t* buffer, size_t 
 }
 
 template <typename T>
-void GenotypeParser::compute_dosages_v12_phased(const uint8_t* missing_ptr, const uint8_t* prob_ptr,
-                                             size_t prob_bytes_available, uint32_t n_samples,
-                                             uint8_t bits_per_prob, const int* sample_indices,
-                                             int n_indices, T* output) {
+LAZYBGEN_ALWAYS_INLINE void GenotypeParser::compute_dosages_v12_phased_body(
+    const uint8_t* missing_ptr, const uint8_t* prob_ptr, size_t prob_bytes_available,
+    uint32_t n_samples, uint8_t bits_per_prob, const int* sample_indices, int n_indices,
+    T* output) {
     if (bits_per_prob < 1 || bits_per_prob > 32) {
         throw std::runtime_error("Unsupported bits per probability: " +
                                  std::to_string(bits_per_prob));
@@ -621,7 +589,7 @@ void GenotypeParser::compute_dosages_direct_impl(const uint8_t* buffer, size_t s
                 // Some BGEN files have malformed genotype data
 
                 // Check if this could be V1.1 format (6 bytes per sample)
-                if (size == n_samples * 6) {
+                if (size == static_cast<size_t>(n_samples) * 6) {
                     compute_dosages_v11_typed(buffer, size, n_samples, output);
                     return;
                 }
@@ -682,6 +650,42 @@ void GenotypeParser::compute_dosages_filtered(const uint8_t* buffer, size_t size
     auto data = parse(buffer, size, layout, compression, n_samples, n_alleles);
     data->extract_dosages_filtered(sample_indices, n_indices, output);
 }
+
+#ifdef LAZYBGEN_X86_AVX2
+template <typename T>
+LAZYBGEN_TARGET_AVX2 void GenotypeParser::compute_dosages_v12_phased_avx2(
+    const uint8_t* missing_ptr, const uint8_t* prob_ptr, size_t prob_bytes_available,
+    uint32_t n_samples, uint8_t bits_per_prob, const int* sample_indices, int n_indices,
+    T* output) {
+    compute_dosages_v12_phased_body<T>(missing_ptr, prob_ptr, prob_bytes_available, n_samples,
+                                       bits_per_prob, sample_indices, n_indices, output);
+}
+#endif
+
+// Phased decode, dispatched like compute_dosages_v12_direct: the AVX2/FMA build
+// of the same body when the CPU has it, as 0.2.x compiled it everywhere.
+template <typename T>
+void GenotypeParser::compute_dosages_v12_phased(const uint8_t* missing_ptr, const uint8_t* prob_ptr,
+                                             size_t prob_bytes_available, uint32_t n_samples,
+                                             uint8_t bits_per_prob, const int* sample_indices,
+                                             int n_indices, T* output) {
+#ifdef LAZYBGEN_X86_AVX2
+    if (cpu_has_avx2()) {
+        compute_dosages_v12_phased_avx2<T>(missing_ptr, prob_ptr, prob_bytes_available, n_samples,
+                                           bits_per_prob, sample_indices, n_indices, output);
+        return;
+    }
+#endif
+    compute_dosages_v12_phased_body<T>(missing_ptr, prob_ptr, prob_bytes_available, n_samples,
+                                       bits_per_prob, sample_indices, n_indices, output);
+}
+
+template void GenotypeParser::compute_dosages_v12_phased<float>(const uint8_t*, const uint8_t*,
+                                                             size_t, uint32_t, uint8_t, const int*,
+                                                             int, float*);
+template void GenotypeParser::compute_dosages_v12_phased<double>(const uint8_t*, const uint8_t*,
+                                                              size_t, uint32_t, uint8_t,
+                                                              const int*, int, double*);
 
 // Explicit template instantiation
 template uint16_t GenotypeParser::read_le<uint16_t>(const uint8_t*);

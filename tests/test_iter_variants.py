@@ -13,6 +13,8 @@ import numpy as np
 import pytest
 from lazybgen.reader import BgenReader
 
+from lazybgen import load_bgen
+
 
 @pytest.fixture(scope="module")
 def bgen_path():
@@ -126,8 +128,8 @@ def test_iter_variants_region_matches_batch(bgen_path):
     np.testing.assert_array_equal(streamed[finite], batch[finite])
 
 
-@pytest.mark.parametrize("bounds", [{}, {"region_start": 1}])
-def test_open_ended_region_returns_the_whole_chromosome(bgen_path, bounds):
+@pytest.mark.parametrize("from_middle", [False, True])
+def test_open_ended_region_returns_the_rest_of_the_chromosome(bgen_path, from_middle):
     """Omitting region_end selects through the end of the chromosome.
 
     Without an end, the reader asks the index for positions up to 0xFFFFFFFF.
@@ -136,15 +138,19 @@ def test_open_ended_region_returns_the_whole_chromosome(bgen_path, bounds):
     with BgenReader(bgen_path) as reader:
         _, vinfo = reader.load_variants(dtype=np.float64)
         chrom = str(vinfo.iloc[0]["chrom"])
-        expected = int((vinfo["chrom"] == chrom).sum())
+        on_chrom = vinfo[vinfo["chrom"].astype(str) == chrom]
+        bounds = {}
+        if from_middle:
+            bounds["region_start"] = int(on_chrom["pos"].iloc[len(on_chrom) // 2])
+        expected = on_chrom[on_chrom["pos"] >= bounds.get("region_start", 0)]
 
         batch, binfo = reader.load_variants(region_chrom=chrom, dtype=np.float64, **bounds)
         rows = list(reader.iter_variants(region_chrom=chrom, dtype=np.float64, **bounds))
 
-    assert expected > 0
-    assert batch.shape[1] == expected
-    assert len(rows) == expected
-    assert set(binfo["chrom"].astype(str)) == {chrom}
+    assert 0 < len(expected) < len(on_chrom) or not from_middle
+    assert batch.shape[1] == len(expected)
+    assert list(binfo["pos"]) == list(expected["pos"])
+    assert [info["pos"] for info, _ in rows] == list(expected["pos"])
 
 
 def test_iter_variants_sample_indices(bgen_path):
@@ -170,3 +176,36 @@ def test_iter_variants_is_lazy_iterator(bgen_path):
         first = next(gen)
         assert len(first) == 2  # (info, dosage)
         assert isinstance(first[1], np.ndarray)
+
+
+def test_positions_past_two_to_the_31(tmp_path):
+    """Positions at and above 2^31 match through every selection path.
+
+    The index query bound its coordinates as 32-bit signed ints, so a region
+    end or a filtered position from 2^31 up wrapped negative and matched
+    nothing. Positions are unsigned 32-bit in the format, so 2^32 - 1 is legal.
+    """
+    from _bgen_writer import write_v12
+
+    n = 4
+    rng = np.random.default_rng(31)
+    positions = [1000, 2**31 - 1, 2**31, 2**32 - 1]
+    columns = [(rng.integers(0, 128, n), rng.integers(0, 128, n), np.zeros(n, bool)) for _ in positions]
+    path = tmp_path / "big.bgen"
+    write_v12(path, columns, 8, positions=positions)
+    full, info, _ = load_bgen(str(path))
+    assert list(info["pos"]) == positions
+
+    for start, end, want in [(2**31, 2**32 - 1, [2, 3]), (2**31 - 1, 2**31, [1, 2]), (2**32 - 1, 2**32 - 1, [3])]:
+        dos, info, _ = load_bgen(str(path), region=f"01:{start}-{end}")
+        assert list(info["pos"]) == [positions[i] for i in want]
+        np.testing.assert_array_equal(dos, full[:, want])
+
+    vf = {"chromosome": "01", "positions": [2**31, 2**32 - 1], "allele1": ["A", "A"], "allele2": ["G", "G"]}
+    dos, info, _ = load_bgen(str(path), variant_filter=vf)
+    assert list(info["pos"]) == [2**31, 2**32 - 1]
+    np.testing.assert_array_equal(dos, full[:, [2, 3]])
+
+    with BgenReader(str(path)) as reader:
+        rows = list(reader.iter_variants(region_chrom="01", region_start=2**31, region_end=2**32 - 1))
+    assert [r[0]["pos"] for r in rows] == [2**31, 2**32 - 1]

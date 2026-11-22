@@ -58,10 +58,18 @@ struct DosageStats {
     bool has_nan = false;
 };
 
-// Worker threads a block decode starts when num_threads is 0: the CPUs this
-// process may use (its affinity mask and any cgroup CPU quota on Linux), not
-// the machine's core count. Computed once per process.
+// Worker threads a block decode starts when num_threads is 0: on Linux, the
+// CPUs this thread may run on (its affinity mask, read on each call) capped by
+// the tightest cgroup CPU quota (read once per process); elsewhere, the
+// machine's core count.
 size_t default_num_threads();
+
+// The tightest cgroup CPU quota for the process described by `cgroup_path`
+// (a /proc/self/cgroup file), with mount points and roots taken from
+// `mountinfo_path` and `prefix` prepended to each mount point; 0 if none.
+// Exposed so tests can point it at a fake cgroup tree.
+size_t cgroup_cpu_limit_from(const std::string& mountinfo_path, const std::string& cgroup_path,
+                             const std::string& prefix);
 
 class BgenReaderImpl {
    public:
@@ -141,14 +149,15 @@ class BgenReaderImpl {
      * variants into a column-major (Fortran-order) output buffer. Variant i is
      * written to out[i * out_stride .. i * out_stride + n_samples). Compressed
      * bytes are read on the calling thread; inflate + decode run across
-     * num_threads worker threads (0 = auto-detect). Overloaded on output
-     * precision (float / double) to match GenotypeParser::compute_dosages_direct.
+     * num_threads worker threads (0 = default_num_threads(), the CPUs the job
+     * may use). Overloaded on output precision (float / double) to match
+     * GenotypeParser::compute_dosages_direct.
      *
      * @param block Pointer to a contiguous array of variant metadata
      * @param n_variants Number of variants in the block
      * @param out Output buffer (column-major; out_stride elements per variant)
      * @param out_stride Elements between consecutive variant columns (n_samples)
-     * @param num_threads Worker threads (0 = hardware_concurrency)
+     * @param num_threads Worker threads (0 = default_num_threads())
      */
     void read_decode_block_parallel(const VariantMetadata* block, size_t n_variants, float* out,
                                     size_t out_stride, size_t num_threads);
@@ -172,7 +181,7 @@ class BgenReaderImpl {
 
     /**
      * Number of worker threads used by the parallel block decode path
-     * (0 = auto-detect).
+     * (0 = default_num_threads(), the CPUs the job may use).
      */
     size_t num_threads() const;
 
@@ -195,7 +204,7 @@ class BgenReaderImpl {
     /**
      * Set the worker-thread count used by the parallel block decode path
      *
-     * @param n Number of threads (0 = auto-detect)
+     * @param n Number of threads (0 = default_num_threads(), the CPUs the job may use)
      */
     void set_num_threads(size_t n);
 
@@ -222,6 +231,13 @@ class BgenReaderImpl {
      * Close the file
      */
     void close();
+
+    /**
+     * Tell the reader its embedded sample IDs will not be read (the caller
+     * supplies a .sample file), so close() releases the file instead of
+     * keeping it mapped for them.
+     */
+    void discard_embedded_sample_ids();
 
    private:
     // Implementation details hidden with pimpl

@@ -239,6 +239,17 @@ class GenotypeParser {
                                         size_t prob_bytes_available, uint32_t n_samples,
                                         uint8_t bits_per_prob, const int* sample_indices,
                                         int n_indices, T* output);
+    // The phased body, compiled with and without AVX2/FMA like the direct one.
+    template <typename T>
+    static void compute_dosages_v12_phased_body(const uint8_t* missing_ptr, const uint8_t* prob_ptr,
+                                        size_t prob_bytes_available, uint32_t n_samples,
+                                        uint8_t bits_per_prob, const int* sample_indices,
+                                        int n_indices, T* output);
+    template <typename T>
+    static void compute_dosages_v12_phased_avx2(const uint8_t* missing_ptr, const uint8_t* prob_ptr,
+                                        size_t prob_bytes_available, uint32_t n_samples,
+                                        uint8_t bits_per_prob, const int* sample_indices,
+                                        int n_indices, T* output);
 
     // Helper to read little-endian integers
     template <typename T>

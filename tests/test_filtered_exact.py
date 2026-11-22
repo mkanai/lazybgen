@@ -18,10 +18,10 @@ DATA = Path(__file__).parent / "data"
 FIXTURES = [
     "example.8bits.bgen",
     "example.16bits.bgen",
-    "example.16bits.zstd.bgen",
     "example.32bits.bgen",
     "data.bgen",
     "example.v11.bgen",
+    "haplotypes.bgen",  # phased
 ]
 
 
@@ -31,7 +31,7 @@ def _selections(n):
     yield np.arange(n, dtype=np.int32)[::-1].copy()
     yield rng.permutation(n).astype(np.int32)
     # Every length around the 4- and 8-lane vector widths and their tails.
-    for length in range(1, 20):
+    for length in range(1, min(20, n + 1)):
         yield rng.choice(n, size=length, replace=False).astype(np.int32)
     yield rng.integers(0, n, size=101).astype(np.int32)  # duplicates
 

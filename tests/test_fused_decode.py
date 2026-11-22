@@ -15,101 +15,12 @@ the exact widening of the float32 one, and the range the reader reports must
 equal the range of the values it returned.
 """
 
-import os
-import sqlite3
-import struct
-import time
-import zlib
-
 import numpy as np
 import pytest
+from _bgen_writer import write_v12
 from lazybgen.reader import BgenReader
 
 NAN32 = np.float32(np.nan)
-
-
-def _s2(x):
-    return struct.pack("<H", len(x)) + x.encode()
-
-
-def _s4(x):
-    return struct.pack("<I", len(x)) + x.encode()
-
-
-def _write_v12(path, columns, bits, compress=zlib.compress):
-    """Write a zlib-compressed layout-2 BGEN with one variant per column.
-
-    Each column is (aa, ab, missing): integer arrays of the stored P(AA) and
-    P(AB) and a boolean missing flag per sample. Also writes the .bgi index.
-    """
-    n = len(columns[0][0])
-    blocks = []
-    word = "<B" if bits == 8 else "<H"
-    for v, (aa, ab, miss) in enumerate(columns):
-        ploidy = bytes(0x82 if m else 0x02 for m in miss)
-        probs = b"".join(struct.pack(word, int(a)) + struct.pack(word, int(b)) for a, b in zip(aa, ab))
-        geno = struct.pack("<IHBB", n, 2, 2, 2) + ploidy + struct.pack("<BB", 0, bits) + probs
-        packed = compress(geno)
-        pos = 1000 + v
-        block = (
-            _s2(f"v{v}")
-            + _s2(f"rs{v}")
-            + _s2("01")
-            + struct.pack("<IH", pos, 2)
-            + _s4("A")
-            + _s4("G")
-            + struct.pack("<II", len(packed) + 4, len(geno))
-            + packed
-        )
-        blocks.append((pos, f"rs{v}", block))
-    _write_file(path, n, layout=2, blocks=blocks)
-
-
-def _write_file(path, n, layout, blocks):
-    """Lay out a zlib-compressed BGEN with embedded sample IDs, plus its .bgi.
-
-    blocks is a list of (position, rsid, variant block bytes) in file order.
-    """
-    samples = [f"s{i}" for i in range(n)]
-    ids = b"".join(_s2(s) for s in samples)
-    sample_block = struct.pack("<II", 8 + len(ids), n) + ids
-    flags = 1 | (layout << 2) | (1 << 31)  # zlib, the layout, sample IDs present
-    header = struct.pack("<II", len(blocks), n) + b"bgen" + struct.pack("<I", flags)
-    header_length = 4 + len(header)  # L_H counts its own 4 bytes
-    prefix = struct.pack("<II", header_length + len(sample_block), header_length) + header
-
-    rows = []
-    body = bytearray()
-    start = len(prefix) + len(sample_block)
-    for pos, rsid, block in blocks:
-        rows.append(("01", pos, rsid, 2, "A", "G", start + len(body), len(block)))
-        body += block
-
-    with open(path, "wb") as f:
-        f.write(prefix + sample_block + body)
-
-    conn = sqlite3.connect(str(path) + ".bgi")
-    try:
-        conn.execute(
-            "CREATE TABLE Metadata (filename TEXT NOT NULL, file_size INT NOT NULL, "
-            "last_write_time INT NOT NULL, first_1000_bytes BLOB NOT NULL, index_creation_time INT NOT NULL)"
-        )
-        with open(path, "rb") as f:
-            first = f.read(1000)
-        now = int(time.time())
-        conn.execute(
-            "INSERT INTO Metadata VALUES (?,?,?,?,?)",
-            (os.path.basename(str(path)), os.path.getsize(path), now, first, now),
-        )
-        conn.execute(
-            "CREATE TABLE Variant (chromosome TEXT NOT NULL, position INT NOT NULL, rsid TEXT NOT NULL, "
-            "number_of_alleles INT NOT NULL, allele1 TEXT NOT NULL, allele2 TEXT NULL, "
-            "file_start_position INT NOT NULL, size_in_bytes INT NOT NULL)"
-        )
-        conn.executemany("INSERT INTO Variant VALUES (?,?,?,?,?,?,?,?)", rows)
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def _reference(columns, bits):
@@ -154,21 +65,38 @@ def _columns(n, bits, rng):
     return cols
 
 
+def _bits(a):
+    a = np.ascontiguousarray(a)
+    return a.view(np.uint32 if a.dtype == np.float32 else np.uint64)
+
+
+def _range(values):
+    finite = values[~np.isnan(values)]
+    lo = float(finite.min()) if finite.size else float("inf")
+    hi = float(finite.max()) if finite.size else float("-inf")
+    return (lo, hi, bool(np.isnan(values).any()))
+
+
 def _check(path, columns, bits, num_threads):
     expected32 = _reference(columns, bits)
+    n_variants = expected32.shape[1]
     for dtype in (np.float32, np.float64):
+        want = expected32.astype(dtype)
         with BgenReader(str(path), num_threads=num_threads) as reader:
             got, _ = reader.load_variants(dtype=dtype)
             stats = reader.last_dosage_stats
-        want = expected32.astype(dtype)
-        utype = np.uint32 if dtype == np.float32 else np.uint64
-        diff = got.view(utype) != np.ascontiguousarray(want).view(utype).reshape(got.shape)
-        assert not diff.any(), f"{int(diff.sum())} values differ ({np.dtype(dtype).name})"
-        if stats is not None:
-            finite = want[~np.isnan(want)]
-            lo = float(finite.min()) if finite.size else float("inf")
-            hi = float(finite.max()) if finite.size else float("-inf")
-            assert stats == (lo, hi, bool(np.isnan(want).any()))
+            assert (_bits(got) == _bits(want)).all(), f"values differ ({np.dtype(dtype).name})"
+            # The block decode (two or more variants, more than one thread)
+            # returns the range with the values; the serial loop returns none.
+            if num_threads != 1 and n_variants > 1:
+                assert stats == _range(want)
+                # Every adjacent pair, so ranges narrower than [0, 2], ones
+                # with no missing call, and all-missing (inf, -inf) are seen.
+                for j in range(n_variants - 1):
+                    reader.load_variants(dtype=dtype, region_chrom="01", region_start=1000 + j, region_end=1001 + j)
+                    assert reader.last_dosage_stats == _range(want[:, j : j + 2]), f"pair {j}"
+            else:
+                assert stats is None
 
 
 # Column lengths around the 8- and 16-lane vector widths, so the vector loop,
@@ -182,19 +110,33 @@ def test_fused_decode_matches_reference(tmp_path, bits, n):
     rng = np.random.default_rng(n * 31 + bits)
     columns = _columns(n, bits, rng)
     path = tmp_path / f"f{bits}_{n}.bgen"
-    _write_v12(path, columns, bits)
+    write_v12(path, columns, bits)
     for num_threads in (1, 4):
         _check(path, columns, bits, num_threads)
 
 
-def test_every_8bit_numerator(tmp_path):
-    """All 32,896 valid (P(AA), P(AB)) pairs, so all 511 numerators, in one column."""
+@pytest.mark.parametrize("n_samples", [32896, 15])
+def test_every_8bit_numerator(tmp_path, n_samples):
+    """All 32,896 valid (P(AA), P(AB)) pairs, so all 511 numerators.
+
+    As one long column the vector loop sees them all; as 15-sample columns
+    (shorter than a vector, so decoded entirely by the scalar tail) the lookup
+    table does.
+    """
     aa, ab = np.meshgrid(np.arange(256), np.arange(256), indexing="ij")
     keep = (aa + ab) <= 255
     aa, ab = aa[keep], ab[keep]
-    rng = np.random.default_rng(1)
-    order = rng.permutation(aa.size)
-    columns = [(aa[order], ab[order], np.zeros(aa.size, bool))]
+    order = np.random.default_rng(1).permutation(aa.size)
+    aa, ab = aa[order], ab[order]
+    pad = (-aa.size) % n_samples  # fill the last column with valid zeros
+    aa, ab = np.concatenate([aa, np.zeros(pad, int)]), np.concatenate([ab, np.zeros(pad, int)])
+    columns = [
+        (aa[k : k + n_samples], ab[k : k + n_samples], np.zeros(n_samples, bool)) for k in range(0, aa.size, n_samples)
+    ]
     path = tmp_path / "all8.bgen"
-    _write_v12(path, columns, 8)
-    _check(path, columns, 8, num_threads=2)
+    write_v12(path, columns, 8)
+    want = _reference(columns, 8)
+    for num_threads in (1, 2):
+        with BgenReader(str(path), num_threads=num_threads) as reader:
+            got, _ = reader.load_variants(dtype=np.float32)
+        assert (_bits(got) == _bits(want)).all()
