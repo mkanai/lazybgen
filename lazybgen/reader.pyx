@@ -20,6 +20,16 @@ from .remote import is_remote_path, choose_remote_block_size, resolve_remote_bac
 from .region import validate_region_bounds
 
 
+def _default_num_threads():
+    """Workers a parallel decode starts for num_threads=0 (affinity- and cgroup-aware)."""
+    return default_num_threads()
+
+
+def _cgroup_cpu_limit_from(mountinfo_path, cgroup_path, prefix=""):
+    """Test hook: the cgroup CPU quota for a fake mountinfo/cgroup pair (0 = none)."""
+    return cgroup_cpu_limit_from(os.fsencode(mountinfo_path), os.fsencode(cgroup_path), os.fsencode(prefix))
+
+
 def _validate_dtype(dtype):
     """Reject a non-floating output dtype before any decode.
 
@@ -81,9 +91,10 @@ cdef class BgenReader:
         sample_path : str, optional
             Path to sample file
         num_threads : int, optional
-            Worker threads for decoding. Must be >= 0. 0 (default) auto-detects the
-            CPU core count and decodes blocks in parallel (several times faster on
-            multi-core machines, byte-identical to single-threaded decoding); 1
+            Worker threads for decoding. Must be >= 0. 0 (default) decodes blocks in
+            parallel with one worker per CPU the job may use (on Linux, its CPU
+            affinity capped by any cgroup CPU quota; elsewhere, the core count),
+            byte-identical to single-threaded decoding; 1
             decodes on a single thread; N > 1 uses N threads. This is the only knob
             for selecting parallel vs sequential decoding.
         storage_options : dict, optional
@@ -145,12 +156,12 @@ cdef class BgenReader:
         self.is_open = True
 
         # Select the decoder from num_threads: 1 uses the true sequential path (no
-        # worker-thread overhead); anything else uses parallel decode (0 auto-detects
-        # the core count at decode time). set_decompressor_type remains available for
+        # worker-thread overhead); anything else uses parallel decode (0 sizes the
+        # pool to the CPUs the job may use, at decode time). set_decompressor_type remains available for
         # advanced callers that want to force a backend after construction.
         if num_threads < 0:
             raise ValueError(
-                f"num_threads must be >= 0 (0 auto-detects the core count); got {num_threads}"
+                f"num_threads must be >= 0 (0 uses one worker per available CPU); got {num_threads}"
             )
         decompressor_type = 'sequential' if num_threads == 1 else 'parallel'
         self.set_decompressor_type(decompressor_type, num_threads)
@@ -161,6 +172,9 @@ cdef class BgenReader:
         # are parsed on demand.
         if sample_path:
             self._check_sample_file(self.sample_path)
+            # The IDs come from the .sample file, so the embedded block is never
+            # read; let close() release the BGEN instead of keeping it for them.
+            self.impl.get().discard_embedded_sample_ids()
     
     cdef void _init_reader(self) except *:
         """Initialize C++ reader components."""
@@ -275,7 +289,7 @@ cdef class BgenReader:
             decode across worker threads). A default-constructed reader uses
             'parallel' unless num_threads == 1.
         num_threads : int
-            Number of worker threads for the parallel path (0 = auto-detect)
+            Number of worker threads for the parallel path (0 = one per CPU the job may use)
         """
         self._ensure_open()
 
@@ -283,7 +297,7 @@ cdef class BgenReader:
         # Record the worker-thread count so the block-parallel decode path (which
         # reads num_threads() directly) uses it. set_decompressor_type only sets
         # the routing flag; the stored decompressor is always sequential.
-        if decompressor_type == 'parallel' and num_threads > 0:
+        if decompressor_type == 'parallel':
             self.impl.get().set_num_threads(num_threads)
         self.impl.get().set_decompressor_type(cpp_type)
 
@@ -913,7 +927,15 @@ cdef class BgenReader:
             raise ValueError("BGEN reader is closed")
     
     def close(self):
-        """Close the BGEN reader."""
+        """Close the BGEN reader.
+
+        ``samples`` stays readable afterwards. A local file whose embedded
+        sample IDs have not been read yet stays memory-mapped (no file
+        descriptor is held) until they are read or the reader is freed, so the
+        IDs are parsed from the file as it was opened: replacing or truncating
+        the file in place before then is undefined. A reader given a .sample
+        file, or whose IDs were already read, releases the file here.
+        """
         if self.is_open:
             if self.impl:
                 self.impl.get().close()

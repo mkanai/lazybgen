@@ -13,11 +13,23 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
+        compiler: [gcc]
+        include:
+          # Linux aarch64 builds the NEON kernels with GCC.
+          - os: ubuntu-24.04-arm
+            python-version: '3.12'
+            compiler: gcc
+          # x86-64 clang, the compiler an Intel-mac source build uses: it is
+          # stricter than GCC about the per-function AVX2 targets.
+          - os: ubuntu-latest
+            python-version: '3.12'
+            compiler: clang
 
     steps:
       - uses: actions/checkout@v7
@@ -33,9 +45,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libsqlite3-dev
+          if [ "${{ matrix.compiler }}" = clang ]; then sudo apt-get install -y clang; fi
 
       - name: Install package (with build + dev deps)
         run: |
+          if [ "${{ matrix.compiler }}" = clang ]; then export CC=clang CXX=clang++; fi
           python -m pip install --upgrade pip setuptools wheel
           pip install -e .[dev]
           # Editable installs don't place the compiled .so next to the sources,
@@ -52,6 +66,52 @@ jobs:
 
       - name: Run tests
         run: pytest tests/ -v
+
+      # The decode kernels again with SIMD forced off: the code a CPU without
+      # AVX2 runs (and the scalar paths on aarch64), on a runner that has it.
+      - name: Run decode tests without SIMD
+        if: matrix.python-version == '3.12'
+        env:
+          LAZYBGEN_DISABLE_SIMD: '1'
+        run: pytest -q tests/test_fused_decode.py tests/test_filtered_exact.py tests/test_spec_conformance.py tests/test_reader.py
+
+  # Import and decode on an emulated CPU without AVX2 (issue #8): any AVX2
+  # instruction outside the runtime-dispatched kernels dies with SIGILL here.
+  # Pinned to 24.04, where these pass: on the 26.04 image Python died with
+  # SIGILL under qemu's Westmere model before pytest printed anything, which
+  # tests the image rather than this package.
+  no-avx2:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install package
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libsqlite3-dev qemu-user
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -e .[dev]
+          python setup.py build_ext --inplace
+
+      - name: Run decode tests on a CPU without AVX2 (qemu Westmere)
+        run: |
+          # Probe in layers so a SIGILL names the culprit: the interpreter,
+          # numpy and pandas, then lazybgen itself.
+          qemu-x86_64 -cpu Westmere "$(which python)" -c "print('python ok')"
+          qemu-x86_64 -cpu Westmere "$(which python)" -c "import numpy, pandas; print('numpy/pandas ok')"
+          qemu-x86_64 -cpu Westmere "$(which python)" -c "import lazybgen.reader; print('lazybgen ok')"
+          qemu-x86_64 -cpu Westmere "$(which python)" -m pytest -q -p no:cacheprovider \
+            tests/test_fused_decode.py tests/test_filtered_exact.py tests/test_spec_conformance.py \
+            tests/test_reader.py tests/test_phased.py tests/test_parallel_load.py \
+            tests/test_iter_variants.py tests/test_missing_genotypes.py tests/test_sample_block.py \
+            tests/test_dosage_stats.py
 
   # Quick sanity build of sdist + a single wheel on Linux, so packaging
   # breakage is caught on every PR without paying for the full wheel matrix.

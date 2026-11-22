@@ -6,15 +6,12 @@ requires = [
     "wheel",
     "Cython>=0.29.0",
     "numpy>=2.0.0",
-    # Only the Windows zstd build shells out to CMake; libdeflate and the Unix
-    # zstd build compile directly from source.
-    'cmake>=3.12; sys_platform == "win32"',
 ]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "lazybgen"
-version = "0.2.1"
+version = "0.3.0"
 description = "High-performance BGEN reader with cloud (GCS/S3) partial-read support"
 readme = "README.md"
 authors = [
@@ -70,7 +67,6 @@ dev = [
     "pytest>=6.0.0",
     "black>=25.11.0",
     "Cython>=0.29.0",
-    'cmake>=3.12; sys_platform == "win32"',  # only the Windows zstd build needs it
     "ruff>=0.6.0",
     "check-wheel-contents>=0.6.0",  # guards against wheel bloat / missing py.typed
     # "bgen>=1.8.0",  # optional: enables correctness comparison vs a reference reader

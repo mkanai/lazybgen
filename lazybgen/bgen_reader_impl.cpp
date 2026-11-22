@@ -1,23 +1,31 @@
 #include "bgen_reader_impl.h"
 
-#if defined(__AVX2__)
+#include "format/simd_target.h"
+#if defined(LAZYBGEN_X86_AVX2)
 #include <immintrin.h>
 #endif
 
 #include "format/bgen_header.h"
 #include "format/genotype_parser.h"
+#include "format/genotype_parser_simd.h"  // cpu_has_avx2
 #include "format/variant_parser.h"
 #include "index/bgi_reader.h"
 #include "io/fsspec_file_reader.h"
 #include <fcntl.h>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cerrno>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <limits>
 #include <mutex>
 #include <thread>
@@ -33,7 +41,244 @@ namespace {
 bool is_remote_scheme(const std::string& f) {
     return f.rfind("gs://", 0) == 0 || f.rfind("s3://", 0) == 0;
 }
+
+// CPUs a cgroup quota allows ("max" or unset -> 0, meaning no limit). v2 keeps
+// "quota period" in cpu.max; v1 keeps the two in cpu.cfs_quota_us and
+// cpu.cfs_period_us, with quota -1 for unlimited. A fractional quota rounds up.
+size_t quota_cpus(long long quota, long long period) {
+    if (quota <= 0 || period <= 0) {
+        return 0;
+    }
+    return static_cast<size_t>(std::max<long long>(1, (quota + period - 1) / period));
+}
+
+size_t cgroup_v2_cpus(const std::string& dir) {
+    std::ifstream f(dir + "/cpu.max");
+    std::string quota;
+    long long period = 0;
+    if (!(f >> quota >> period) || quota == "max") {
+        return 0;
+    }
+    try {
+        return quota_cpus(std::stoll(quota), period);
+    } catch (const std::exception&) {
+        return 0;
+    }
+}
+
+size_t cgroup_v1_cpus(const std::string& dir) {
+    long long quota = -1;
+    long long period = 0;
+    std::ifstream fq(dir + "/cpu.cfs_quota_us");
+    std::ifstream fp(dir + "/cpu.cfs_period_us");
+    if (!(fq >> quota) || !(fp >> period)) {
+        return 0;
+    }
+    return quota_cpus(quota, period);
+}
+
+// mountinfo escapes space, tab, newline and backslash in paths as \ooo.
+std::string unescape_mount_path(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 3 < s.size() &&
+            std::isdigit(static_cast<unsigned char>(s[i + 1])) &&
+            std::isdigit(static_cast<unsigned char>(s[i + 2])) &&
+            std::isdigit(static_cast<unsigned char>(s[i + 3]))) {
+            out.push_back(static_cast<char>((s[i + 1] - '0') * 64 + (s[i + 2] - '0') * 8 +
+                                            (s[i + 3] - '0')));
+            i += 3;
+        } else {
+            out.push_back(s[i]);
+        }
+    }
+    return out;
+}
+
+bool has_token(const std::string& list, const std::string& token) {
+    return ("," + list + ",").find("," + token + ",") != std::string::npos;
+}
+
 }  // namespace
+
+// Tightest CPU quota on this process's cgroup or any ancestor visible in its
+// mount, or 0. Mount points and mount roots come from mountinfo rather than
+// being assumed: a v1 cpu controller may be mounted at cpu,cpuacct while
+// /proc/self/cgroup lists it as cpuacct,cpu, and a container's cgroup mount is
+// often rooted below the hierarchy's root, so the process's cgroup path must
+// be taken relative to that root. A path outside the mount's root (a container
+// without a cgroup namespace) falls back to the mount point's own files.
+// `prefix` is prepended to every mount point, so tests can use a fake tree.
+size_t cgroup_cpu_limit_from(const std::string& mountinfo_path, const std::string& cgroup_path,
+                             const std::string& prefix) {
+    struct Mount {
+        bool v2;
+        std::string root;
+        std::string point;
+    };
+    std::vector<Mount> mounts;
+    {
+        std::ifstream f(mountinfo_path);
+        std::string line;
+        while (std::getline(f, line)) {
+            // id parent major:minor root mount-point options [optional...] - fstype source super-options
+            std::istringstream in(line);
+            std::vector<std::string> fields;
+            std::string w;
+            while (in >> w) {
+                fields.push_back(w);
+            }
+            size_t dash = 0;
+            while (dash < fields.size() && fields[dash] != "-") {
+                ++dash;
+            }
+            if (fields.size() < 5 || dash + 3 > fields.size()) {
+                continue;
+            }
+            const std::string& fstype = fields[dash + 1];
+            const std::string& superopts = dash + 3 < fields.size() ? fields[dash + 3] : std::string();
+            if (fstype == "cgroup2") {
+                mounts.push_back({true, unescape_mount_path(fields[3]), unescape_mount_path(fields[4])});
+            } else if (fstype == "cgroup" && has_token(superopts, "cpu")) {
+                mounts.push_back({false, unescape_mount_path(fields[3]), unescape_mount_path(fields[4])});
+            }
+        }
+    }
+
+    size_t limit = 0;
+    auto take = [&limit](size_t n) {
+        if (n > 0 && (limit == 0 || n < limit)) {
+            limit = n;
+        }
+    };
+    std::ifstream f(cgroup_path);
+    std::string line;
+    while (std::getline(f, line)) {
+        // "hierarchy-id:controllers:path"; v2 is "0::path".
+        const size_t a = line.find(':');
+        const size_t b = a == std::string::npos ? a : line.find(':', a + 1);
+        if (b == std::string::npos) {
+            continue;
+        }
+        const std::string controllers = line.substr(a + 1, b - a - 1);
+        const std::string path = line.substr(b + 1);
+        const bool v2 = controllers.empty();
+        if (!v2 && !has_token(controllers, "cpu")) {
+            continue;
+        }
+        // The process's cgroup relative to each mount's root, for the mounts
+        // whose root contains it. A mount of some other subtree (a runtime or
+        // monitoring agent bind-mounting a container's cgroup, say) says
+        // nothing about this process, so its quota is not taken. Only when no
+        // mount resolves the path (a container whose cgroup namespace hides
+        // the real path) is the process taken to sit at the mount point.
+        std::vector<std::pair<const Mount*, std::string>> resolved;
+        for (const Mount& m : mounts) {
+            if (m.v2 != v2) {
+                continue;
+            }
+            if (m.root == "/") {
+                resolved.emplace_back(&m, path.empty() ? "/" : path);
+            } else if (path == m.root) {
+                resolved.emplace_back(&m, "/");
+            } else if (path.compare(0, m.root.size() + 1, m.root + "/") == 0) {
+                resolved.emplace_back(&m, path.substr(m.root.size()));
+            }
+        }
+        if (resolved.empty()) {
+            for (const Mount& m : mounts) {
+                if (m.v2 == v2) {
+                    resolved.emplace_back(&m, "/");
+                }
+            }
+        }
+        for (auto& entry : resolved) {
+            const Mount& m = *entry.first;
+            std::string rel = entry.second;
+            // Walk from the process's cgroup up to the mount point; a parent's
+            // quota caps its children.
+            while (true) {
+                const std::string dir = prefix + m.point + (rel == "/" ? std::string() : rel);
+                take(v2 ? cgroup_v2_cpus(dir) : cgroup_v1_cpus(dir));
+                if (rel == "/") {
+                    break;
+                }
+                const size_t slash = rel.find_last_of('/');
+                rel = slash == 0 || slash == std::string::npos ? "/" : rel.substr(0, slash);
+            }
+        }
+    }
+    return limit;
+}
+
+namespace {
+#if defined(__linux__)
+// CPUs in this thread's affinity mask, or 0 if unknown. The mask is read with a
+// buffer that grows until the kernel accepts it, so a machine with more CPUs
+// than a cpu_set_t holds still reports them.
+size_t affinity_cpus() {
+    for (int ncpu = CPU_SETSIZE; ncpu <= (1 << 20); ncpu *= 2) {
+        cpu_set_t* set = CPU_ALLOC(ncpu);
+        if (!set) {
+            return 0;
+        }
+        const size_t bytes = CPU_ALLOC_SIZE(ncpu);
+        CPU_ZERO_S(bytes, set);
+        const int rc = sched_getaffinity(0, bytes, set);
+        const int count = rc == 0 ? CPU_COUNT_S(bytes, set) : 0;
+        const bool too_small = rc != 0 && errno == EINVAL;
+        CPU_FREE(set);
+        if (rc == 0) {
+            return count > 0 ? static_cast<size_t>(count) : 0;
+        }
+        if (!too_small) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+// The cgroup quota, read once per process: parsing mountinfo costs tens of
+// microseconds, and this is consulted on every block decode. A forked child
+// re-reads it, since it may have been moved to another cgroup. No lock: a
+// child forked while another thread held one would deadlock on its first
+// decode. Threads racing on the first call each compute the same value, and
+// the release/acquire pair publishes the value before the pid that marks it.
+size_t cached_cgroup_cpu_limit() {
+    static std::atomic<pid_t> cached_pid{-1};
+    static std::atomic<size_t> cached{0};
+    const pid_t pid = getpid();
+    if (cached_pid.load(std::memory_order_acquire) != pid) {
+        cached.store(cgroup_cpu_limit_from("/proc/self/mountinfo", "/proc/self/cgroup", ""),
+                     std::memory_order_relaxed);
+        cached_pid.store(pid, std::memory_order_release);
+    }
+    return cached.load(std::memory_order_relaxed);
+}
+#endif
+
+}  // namespace
+
+size_t default_num_threads() {
+    size_t cpus = std::thread::hardware_concurrency();
+#if defined(__linux__)
+    // A SLURM allocation, taskset or a container cpuset narrows the CPUs this
+    // process may run on without changing the machine's core count, and a
+    // cgroup quota limits how much of them it may use. Starting one worker per
+    // core of the machine then oversubscribes the job. The affinity mask is read
+    // on every call (one system call), so a later taskset or a forked child
+    // pinned to fewer CPUs is seen.
+    const size_t allowed = affinity_cpus();
+    if (allowed > 0 && (cpus == 0 || allowed < cpus)) {
+        cpus = allowed;
+    }
+    const size_t quota = cached_cgroup_cpu_limit();
+    if (quota > 0 && (cpus == 0 || quota < cpus)) {
+        cpus = quota;
+    }
+#endif
+    return cpus == 0 ? static_cast<size_t>(1) : cpus;
+}
 
 // Using directives for nested namespaces
 using index::BgiReader;
@@ -114,6 +359,9 @@ class RegularFileReader : public FileReader {
         auto current_pos = file_.tellg();
         file_.seekg(offset);
         size_t bytes_read = read(buffer, size);
+        // A short read sets eof/fail, and a stream in that state ignores
+        // seekg, so clear it before restoring the position.
+        file_.clear();
         file_.seekg(current_pos);
         return bytes_read;
     }
@@ -180,6 +428,11 @@ class MMapFileReader : public FileReader {
             ::close(fd_);
             throw std::runtime_error("Failed to mmap file: " + filename);
         }
+        // The mapping stays valid without the descriptor, so do not hold one
+        // per open reader (a process keeping many readers would otherwise run
+        // into its open-file limit).
+        ::close(fd_);
+        fd_ = -1;
 
         // Let the kernel adapt its readahead to the actual access pattern
         // (MADV_NORMAL): it ramps up for sequential scans (full-file / large
@@ -309,6 +562,7 @@ class BgenReaderImpl::Impl {
     // Destructor
     ~Impl() {
         close();
+        release_id_reader();
     }
 
     // Get header
@@ -322,6 +576,9 @@ class BgenReaderImpl::Impl {
     // never look at, and callers that supply their own .sample file discard
     // them outright.
     const std::vector<std::string>& sample_ids() {
+        if (header_.has_sample_ids && !embedded_ids_loaded_) {
+            load_embedded_sample_ids();
+        }
         if (sample_ids_.empty() && !header_.has_sample_ids && header_.n_samples > 0) {
             sample_ids_.reserve(header_.n_samples);
             for (uint32_t i = 0; i < header_.n_samples; ++i) {
@@ -499,7 +756,7 @@ class BgenReaderImpl::Impl {
         return scan_dosages_scalar(values, n);
     }
 
-#if defined(__AVX2__)
+#if defined(LAZYBGEN_X86_AVX2)
     // The scalar loop above will not auto-vectorize, and cannot be made to:
     // vminpd returns its second operand when either is NaN, so a NaN would
     // poison the accumulator, and the compiler will not reorder around that.
@@ -513,7 +770,13 @@ class BgenReaderImpl::Impl {
     // so it keeps the scalar loop rather than a second copy of this.
     // A non-template overload, which wins over the template above for an exact
     // double match. An explicit specialization is not allowed at class scope.
+    // It takes the AVX2 path only on a CPU that has it.
     static DosageStats scan_dosages(const double* values, size_t n) {
+        return ::lazybgen::bgen::cpu_has_avx2() ? scan_dosages_avx2(values, n)
+                                                : scan_dosages_scalar(values, n);
+    }
+
+    LAZYBGEN_TARGET_AVX2 static DosageStats scan_dosages_avx2(const double* values, size_t n) {
         const __m256d pos_inf = _mm256_set1_pd(std::numeric_limits<double>::infinity());
         const __m256d neg_inf = _mm256_set1_pd(-std::numeric_limits<double>::infinity());
         const __m256d all_ones = _mm256_castsi256_pd(_mm256_set1_epi32(-1));
@@ -560,7 +823,7 @@ class BgenReaderImpl::Impl {
         }
         return DosageStats{lo, hi, nan_seen};
     }
-#endif  // __AVX2__
+#endif  // LAZYBGEN_X86_AVX2
 
     // Fold per-variant summaries into one. DosageStats defaults to +inf/-inf,
     // so an entry no worker wrote leaves the combined bounds unchanged instead
@@ -688,7 +951,7 @@ class BgenReaderImpl::Impl {
         if (n_variants == 0) {
             return;
         }
-        size_t hw = num_threads ? num_threads : std::thread::hardware_concurrency();
+        size_t hw = num_threads ? num_threads : default_num_threads();
         if (hw == 0) {
             hw = 1;
         }
@@ -857,10 +1120,15 @@ class BgenReaderImpl::Impl {
                 // Data is already decompressed; pass the format-layer
                 // CompressionType::None (distinct from decompress::).
                 T* column = out + i * out_stride;
+                ::lazybgen::bgen::ColumnStats fused;
                 ::lazybgen::bgen::GenotypeParser::compute_dosages_direct(
                     buf, size, layout, ::lazybgen::bgen::CompressionType::None, n_samples,
-                    j.n_alleles, column);
-                per_variant[i] = scan_dosages(column, n_samples);
+                    j.n_alleles, column, &fused);
+                // The 8/16-bit kernels return the range with the decode; only
+                // the other layouts need a second pass over the column.
+                per_variant[i] = fused.valid
+                                     ? DosageStats{fused.min_value, fused.max_value, fused.has_nan}
+                                     : scan_dosages(column, n_samples);
             },
             out_stride * sizeof(T));
         last_block_stats_ = combine_dosage_stats(per_variant);
@@ -944,8 +1212,17 @@ class BgenReaderImpl::Impl {
     // Close file
     void close() {
         if (file_reader_) {
-            file_reader_->close();
-            file_reader_.reset();
+            if (header_.has_sample_ids && !embedded_ids_loaded_ && !embedded_ids_discarded_ &&
+                sample_block_bytes_.empty()) {
+                // A local reader whose embedded IDs nobody has read yet keeps
+                // its mapping for them, so samples still work after close()
+                // without open() copying the block for every reader; the
+                // mapping goes once the IDs are parsed or the reader is freed.
+                id_reader_ = std::move(file_reader_);
+            } else {
+                file_reader_->close();
+                file_reader_.reset();
+            }
         }
         if (bgi_reader_) {
             bgi_reader_.reset();
@@ -1024,49 +1301,113 @@ class BgenReaderImpl::Impl {
         }
     }
 
-    // Read sample IDs
+    // Check the embedded sample-ID block's shape without building the IDs.
+    // Building one string per sample is the bulk of opening a biobank-scale
+    // file, and a reader given a .sample file never uses them, so sample_ids()
+    // parses the block the first time anyone asks. A local file is read from
+    // its mapping then (copying the block at open cost every reader a few
+    // milliseconds at 500k samples); a remote reader keeps the bytes now, so it
+    // pays no second fetch and holds no connection open after close().
     void read_sample_ids() {
         if (header_.has_sample_ids) {
-            // Current position should be right after header
-            uint64_t sample_block_pos = file_reader_->tell();
+            // The block starts right after the header, at 4 + L_H.
+            const uint64_t sample_block_pos = file_reader_->tell();
 
-            // Read sample block size
-            uint8_t size_buffer[4];
-            size_t bytes_read = file_reader_->read(size_buffer, 4);
-            if (bytes_read < 4) {
+            // L_SI (the block's length, counting these 4 bytes) and N.
+            uint8_t prefix[8];
+            if (file_reader_->read(prefix, 8) < 8) {
                 throw std::runtime_error("Failed to read sample block size");
             }
+            const uint64_t block_size = read_u32_le(prefix);
+            const uint64_t n_in_block = read_u32_le(prefix + 4);
 
-            // Convert from little-endian
-            uint32_t block_size_with_n = static_cast<uint32_t>(size_buffer[0]) |
-                                         (static_cast<uint32_t>(size_buffer[1]) << 8) |
-                                         (static_cast<uint32_t>(size_buffer[2]) << 16) |
-                                         (static_cast<uint32_t>(size_buffer[3]) << 24);
-
-            // Sanity check the block size (should include sample count)
-            if (block_size_with_n < 4 || block_size_with_n > 100000000) {  // 100MB max
+            if (n_in_block != header_.n_samples) {
+                throw std::runtime_error("Sample count mismatch: expected " +
+                                         std::to_string(header_.n_samples) + ", got " +
+                                         std::to_string(n_in_block));
+            }
+            // The block must hold L_SI, N and a 2-byte length per ID, can hold
+            // no more than N IDs of the longest length a 2-byte field allows,
+            // and must end where the variant data begins (offset + 4) or
+            // before it. The upper bound keeps a corrupt L_SI from sizing an
+            // allocation (or a remote download) by the file instead of by N.
+            const uint64_t variants_pos = static_cast<uint64_t>(header_.offset) + 4;
+            if (block_size < 8 + 2 * n_in_block || block_size > 8 + 65537 * n_in_block ||
+                sample_block_pos + block_size > variants_pos ||
+                variants_pos > file_reader_->size()) {
                 throw std::runtime_error("Invalid sample block size: " +
-                                         std::to_string(block_size_with_n));
+                                         std::to_string(block_size));
             }
-
-            // Read full sample block (including the 4-byte size prefix)
-            std::vector<uint8_t> sample_buffer(block_size_with_n + 4);
-            file_reader_->seek(sample_block_pos);
-            bytes_read = file_reader_->read(sample_buffer.data(), block_size_with_n + 4);
-            if (bytes_read < block_size_with_n + 4) {
-                throw std::runtime_error("Failed to read sample block");
+            sample_block_pos_ = sample_block_pos;
+            sample_block_size_ = block_size;
+            if (is_remote_scheme(filename_)) {
+                sample_block_bytes_.resize(block_size);
+                std::memcpy(sample_block_bytes_.data(), prefix, 8);
+                const size_t rest = static_cast<size_t>(block_size - 8);
+                if (rest > 0 && file_reader_->read(sample_block_bytes_.data() + 8, rest) < rest) {
+                    throw std::runtime_error("Failed to read sample block");
+                }
             }
-
-            // Parse sample block
-            auto sample_block =
-                SampleBlockParser::parse(sample_buffer.data(), bytes_read, header_.n_samples);
-            sample_ids_ = std::move(sample_block.sample_ids);
-
-            // Update offset to skip sample block
-            header_.offset = sample_block_pos + block_size_with_n + 4;
         }
         // With no sample block there is nothing to read; sample_ids() builds the
         // placeholder IDs if anyone asks for them.
+    }
+
+    static uint32_t read_u32_le(const uint8_t* b) {
+        return static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[1]) << 8) |
+               (static_cast<uint32_t>(b[2]) << 16) | (static_cast<uint32_t>(b[3]) << 24);
+    }
+
+    // Parse the embedded sample-ID block: the bytes a remote reader kept at
+    // open, or the block read from the local file (or the mapping close() kept
+    // for it). Then drop whatever held them.
+    void load_embedded_sample_ids() {
+        const uint8_t* block = sample_block_bytes_.data();
+        const size_t size = static_cast<size_t>(sample_block_size_);
+        if (sample_block_bytes_.empty()) {
+            FileReader* src = file_reader_ ? file_reader_.get() : id_reader_.get();
+            if (!src) {
+                throw std::runtime_error("Sample IDs are no longer available");
+            }
+            // Positional reads only, so a decode running on the same reader
+            // is undisturbed.
+            block = src->view_at(sample_block_pos_, size);
+            if (!block) {
+                // Publish the bytes only once the read is complete, so a short
+                // read raises on every access instead of leaving a partial
+                // buffer that the next access would parse as the block.
+                std::vector<uint8_t> bytes(size);
+                if (src->read_at(sample_block_pos_, bytes.data(), size) < size) {
+                    throw std::runtime_error("Failed to read sample block");
+                }
+                sample_block_bytes_.swap(bytes);
+                block = sample_block_bytes_.data();
+            }
+        }
+        auto sample_block = SampleBlockParser::parse(block, size, header_.n_samples);
+        sample_ids_ = std::move(sample_block.sample_ids);
+        std::vector<uint8_t>().swap(sample_block_bytes_);
+        embedded_ids_loaded_ = true;
+        release_id_reader();
+    }
+
+   public:
+    // The caller takes its sample IDs from elsewhere (a .sample file), so the
+    // embedded block will not be read: drop a remote reader's copy of it now,
+    // and let close() release a local mapping instead of keeping it for IDs
+    // nobody will ask for. sample_ids() still works while the reader is open.
+    void discard_embedded_sample_ids() {
+        embedded_ids_discarded_ = true;
+        std::vector<uint8_t>().swap(sample_block_bytes_);
+        release_id_reader();
+    }
+
+   private:
+    void release_id_reader() {
+        if (id_reader_) {
+            id_reader_->close();
+            id_reader_.reset();
+        }
     }
 
     // Create default decompressor
@@ -1087,6 +1428,12 @@ class BgenReaderImpl::Impl {
     std::unique_ptr<decompress::VariantDecompressor> decompressor_;
     BgenHeader header_;
     std::vector<std::string> sample_ids_;
+    std::unique_ptr<FileReader> id_reader_;    // kept by close() for unread IDs
+    uint64_t sample_block_pos_ = 0;
+    uint64_t sample_block_size_ = 0;
+    std::vector<uint8_t> sample_block_bytes_;  // remote: embedded ID block, until parsed
+    bool embedded_ids_loaded_ = false;
+    bool embedded_ids_discarded_ = false;
     DosageStats last_block_stats_{std::numeric_limits<double>::infinity(),
                                   -std::numeric_limits<double>::infinity(), false};
     bool is_open_;
@@ -1181,6 +1528,10 @@ bool BgenReaderImpl::is_open() const {
 
 void BgenReaderImpl::close() {
     pimpl_->close();
+}
+
+void BgenReaderImpl::discard_embedded_sample_ids() {
+    pimpl_->discard_embedded_sample_ids();
 }
 
 }  // namespace bgen

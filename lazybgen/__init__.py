@@ -62,7 +62,7 @@ def _create_progress_callback(show_progress: bool, total: int, desc: str = "Load
     return callback
 
 
-def _validate_dosages(dosages) -> bool:
+def _validate_dosages(dosages, max_allowed=2.0) -> bool:
     """Validate dosage values are within expected range; report missing data.
 
     Returns True if the matrix contains any NaN (missing genotypes).
@@ -98,22 +98,34 @@ def _validate_dosages(dosages) -> bool:
             min_dosage = np.nanmin(dosages)
             max_dosage = np.nanmax(dosages)
 
-    _check_dosage_range(min_dosage, max_dosage)
+    _check_dosage_range(min_dosage, max_dosage, max_allowed)
 
     return has_nan
 
 
-def _check_dosage_range(min_dosage, max_dosage) -> None:
-    """Raise if the observed dosage bounds fall outside [0, 2].
+# Largest dosage a conforming v1.1 (layout 1) file can hold. Layout 1 stores
+# each of the three probabilities rounded to a multiple of 1/32768, and the spec
+# decodes them without renormalizing, so rounding can push P(AB) + 2*P(BB) one
+# unit past 2: (0, 1/65536, 65535/65536) rounds half up to (0, 1, 32768), a
+# dosage of 65537/32768. Layout 2 stores P(BB) implicitly and cannot exceed 2,
+# but a layout-2 file may carry v1.1-encoded blocks, which decode like layout 1,
+# and the reader does not report which blocks did; the one-unit tolerance is
+# therefore applied to every file. It is too small to admit any malformed 8-bit
+# layout-2 value (one unit there is 1/255).
+_V11_MAX_DOSAGE = 65537 / 32768
+
+
+def _check_dosage_range(min_dosage, max_dosage, max_allowed=2.0) -> None:
+    """Raise if the observed dosage bounds fall outside [0, max_allowed].
 
     Both bounds ignore missing calls, so an all-missing result has no real value
     to be out of range and correctly passes: it arrives as inf / -inf from the
     reader's own summary, or as NaN from nanmin / nanmax, and neither compares
     true against the bounds.
     """
-    if min_dosage < 0.0 or max_dosage > 2.0:
+    if min_dosage < 0.0 or max_dosage > max_allowed:
         raise ValueError(
-            f"Dosage values out of valid range [0, 2] detected "
+            f"Dosage values out of valid range [0, {max_allowed:.6g}] detected "
             f"(min: {min_dosage:.6f}, max: {max_dosage:.6f}). "
             f"This may indicate: "
             f"1) Corrupted BGEN file data, "
@@ -162,10 +174,10 @@ def load_bgen(
         'mean' (impute with the per-variant mean), 'omit' (drop affected
         samples), or 'warn' (keep NaNs and log a warning).
     num_threads : int, optional
-        Worker threads for decoding. 0 (default) auto-detects the CPU core count
-        and decodes blocks in parallel (several times faster on multi-core
-        machines, byte-identical to serial); 1 forces single-threaded decoding;
-        N > 1 uses N threads.
+        Worker threads for decoding. 0 (default) decodes blocks in parallel with
+        one worker per CPU the job may use (on Linux, its CPU affinity capped by
+        any cgroup CPU quota; elsewhere, the core count), byte-identical to
+        serial; 1 forces single-threaded decoding; N > 1 uses N threads.
     storage_options : dict, optional
         Backend kwargs forwarded to the fsspec filesystem (e.g. {"anon": True}
         for public S3, or for GCS requester-pays buckets {"requester_pays": True}
@@ -306,11 +318,12 @@ def load_bgen(
         # from memory, which at biobank scale costs more than the decode did.
         # The per-variant serial path reports nothing, and then we scan.
         stats = reader.last_dosage_stats
+        max_allowed = _V11_MAX_DOSAGE
         if stats is None:
-            has_nan = _validate_dosages(dosages)
+            has_nan = _validate_dosages(dosages, max_allowed)
         else:
             min_dosage, max_dosage, has_nan = stats
-            _check_dosage_range(min_dosage, max_dosage)
+            _check_dosage_range(min_dosage, max_dosage, max_allowed)
 
         # Handle NaN values if present, reusing the answer from above rather
         # than scanning again.

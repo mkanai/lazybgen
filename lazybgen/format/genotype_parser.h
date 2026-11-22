@@ -60,6 +60,21 @@ inline T decode_dosage_32bit(uint32_t prob_aa, uint32_t prob_ab) {
     return static_cast<T>(static_cast<float>(dosage));
 }
 
+// BGEN v1.1 (layout 1) stores P(AA), P(AB) and P(BB) as 16-bit integers that
+// the spec converts to probabilities by dividing by 32768; all three zero
+// marks a missing call. The dosage is therefore (P(AB) + 2*P(BB)) / 32768.
+// The numerator is an integer below 2^18 and 32768 is a power of two, so the
+// float result is exact, and every v1.1 path (full, filtered, SIMD lanes and
+// scalar tails, float and double) produces the same bits.
+constexpr float kV11Scale = 1.0f / 32768.0f;
+
+inline float decode_dosage_v11(uint16_t prob_aa, uint16_t prob_ab, uint16_t prob_bb) {
+    if ((prob_aa | prob_ab | prob_bb) == 0) {
+        return std::nanf("");
+    }
+    return static_cast<float>(static_cast<uint32_t>(prob_ab) + 2u * prob_bb) * kV11Scale;
+}
+
 // Structure to hold genotype data
 struct GenotypeData {
     uint32_t n_samples;
@@ -85,6 +100,16 @@ struct GenotypeData {
 };
 
 // Genotype parser class
+// Range and missing-call summary of one decoded column, filled by the decode
+// kernels that can produce it in the same pass (valid = true). When valid is
+// false the caller computes it from the column instead.
+struct ColumnStats {
+    double min_value = 0.0;
+    double max_value = 0.0;
+    bool has_nan = false;
+    bool valid = false;
+};
+
 class GenotypeParser {
    public:
     /**
@@ -129,12 +154,16 @@ class GenotypeParser {
     // decode kernel, avoiding a separate float32->float64 cast pass in the caller
     // (~20% of a default float64 full load). Both produce byte-identical values
     // (the double output is the exact widening of the float result).
+    // If stats is non-null, it is set valid when the decode also produced the
+    // column's range (unphased 8/16-bit v1.2), and left invalid otherwise.
     static void compute_dosages_direct(const uint8_t* buffer, size_t size, LayoutType layout,
                                      CompressionType compression, uint32_t n_samples,
-                                     uint16_t n_alleles, float* output);
+                                     uint16_t n_alleles, float* output,
+                                     ColumnStats* stats = nullptr);
     static void compute_dosages_direct(const uint8_t* buffer, size_t size, LayoutType layout,
                                      CompressionType compression, uint32_t n_samples,
-                                     uint16_t n_alleles, double* output);
+                                     uint16_t n_alleles, double* output,
+                                     ColumnStats* stats = nullptr);
 
     /**
      * Compute dosages for specific samples only
@@ -163,7 +192,7 @@ class GenotypeParser {
     template <typename T>
     static void compute_dosages_direct_impl(const uint8_t* buffer, size_t size, LayoutType layout,
                                          CompressionType compression, uint32_t n_samples,
-                                         uint16_t n_alleles, T* output);
+                                         uint16_t n_alleles, T* output, ColumnStats* stats);
 
     // Direct dosage computation for v1.1 (float-only: uses a float SIMD kernel).
     static void compute_dosages_v11_direct(const uint8_t* buffer, size_t size, uint32_t n_samples,
@@ -176,10 +205,22 @@ class GenotypeParser {
     static void compute_dosages_v11_typed(const uint8_t* buffer, size_t size, uint32_t n_samples,
                                 double* output);
 
-    // Direct dosage computation for v1.2 (scalar; templated on output precision)
+    // Direct dosage computation for v1.2 (scalar; templated on output precision).
+    // Dispatches at runtime to the same body compiled with or without AVX2/FMA
+    // (see simd_target.h): the scalar loop runs measurably faster with VEX
+    // encoding, and the AVX2 build keeps results identical to earlier releases.
     template <typename T>
     static void compute_dosages_v12_direct(const uint8_t* buffer, size_t size, uint32_t n_samples,
-                                        uint16_t n_alleles, T* output);
+                                        uint16_t n_alleles, T* output,
+                                        ColumnStats* stats);
+    template <typename T>
+    static void compute_dosages_v12_direct_body(const uint8_t* buffer, size_t size,
+                                             uint32_t n_samples, uint16_t n_alleles, T* output,
+                                        ColumnStats* stats);
+    template <typename T>
+    static void compute_dosages_v12_direct_avx2(const uint8_t* buffer, size_t size,
+                                             uint32_t n_samples, uint16_t n_alleles, T* output,
+                                        ColumnStats* stats);
 
     // Optimized filtered dosage computation for v1.2
     static void compute_dosages_v12_filtered(const uint8_t* buffer, size_t size, uint32_t n_samples,
@@ -195,6 +236,17 @@ class GenotypeParser {
     // otherwise the n_indices requested samples are written (out-of-range -> NaN).
     template <typename T>
     static void compute_dosages_v12_phased(const uint8_t* missing_ptr, const uint8_t* prob_ptr,
+                                        size_t prob_bytes_available, uint32_t n_samples,
+                                        uint8_t bits_per_prob, const int* sample_indices,
+                                        int n_indices, T* output);
+    // The phased body, compiled with and without AVX2/FMA like the direct one.
+    template <typename T>
+    static void compute_dosages_v12_phased_body(const uint8_t* missing_ptr, const uint8_t* prob_ptr,
+                                        size_t prob_bytes_available, uint32_t n_samples,
+                                        uint8_t bits_per_prob, const int* sample_indices,
+                                        int n_indices, T* output);
+    template <typename T>
+    static void compute_dosages_v12_phased_avx2(const uint8_t* missing_ptr, const uint8_t* prob_ptr,
                                         size_t prob_bytes_available, uint32_t n_samples,
                                         uint8_t bits_per_prob, const int* sample_indices,
                                         int n_indices, T* output);

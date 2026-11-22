@@ -42,17 +42,48 @@ if _setuptools_major < MIN_SETUPTOOLS:
 EXTRA_COMPILE_ARGS = ["-O3", "-funroll-loops"]
 EXTRA_LINK_ARGS = []
 
-# Add SIMD optimizations for x86_64 architectures
-if platform.machine() in ["x86_64", "AMD64"]:
-    if sys.platform != "win32":
-        EXTRA_COMPILE_ARGS += ["-mavx", "-mavx2", "-mfma"]
+# No -mavx2 / -mfma / /arch:AVX2: the extension is built for baseline x86-64 so
+# it imports on CPUs without AVX2 (issue #8). The AVX2 kernels enable those
+# instructions per function and are chosen at runtime.
 
 if sys.platform == "darwin":
     EXTRA_COMPILE_ARGS += ["-stdlib=libc++", "-std=c++14"]
 elif sys.platform == "linux":
     EXTRA_COMPILE_ARGS += ["-std=c++14"]
-elif sys.platform == "win32":
-    EXTRA_COMPILE_ARGS = ["/O2", "/std:c++14", "/arch:AVX2"]
+
+
+def jcc_erratum_args():
+    """Assembler flag that keeps jumps from crossing 32-byte boundaries, or [].
+
+    Intel's microcode fix for the Skylake-family JCC erratum (Skylake through
+    Cascade Lake, still common in clusters and clouds) stops the decoded-uop
+    cache from holding any jump that crosses or ends on a 32-byte boundary.
+    Whether libdeflate's inflate loop has such a jump depends on where the
+    linker happens to place it, so its speed swung by ~13% between builds of
+    unrelated code. Padding the jumps away made it fast at every placement
+    measured: multithreaded zlib full and region reads on an n2 Cascade Lake
+    host took about 11% less time, consistent with the erratum, while
+    single-threaded reads and zstd reads were unchanged. It only inserts
+    padding, so the code computes the same thing on every CPU; its
+    speed on CPUs without the erratum has not been measured. Only x86-64 Linux
+    builds of the vendored libdeflate take it, and the flag is probed when that
+    build runs, so an assembler without it still builds.
+    """
+    if sys.platform != "linux" or platform.machine().lower() not in ("x86_64", "amd64"):
+        return []
+    flag = "-Wa,-mbranches-within-32B-boundaries"
+    import tempfile
+
+    compiler = new_compiler()
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "probe.c"
+        src.write_text("int lazybgen_probe(int x) { return x ? x * 3 : 1; }\n")
+        try:
+            compiler.compile([str(src)], output_dir=tmp, extra_preargs=[flag])
+        except Exception:
+            return []
+    return [flag]
+
 
 # Base directory for the BGEN extension sources (the package directory)
 BGEN_DIR = Path("lazybgen")
@@ -75,44 +106,21 @@ def build_libdeflate():
 
     ld_build_dir.mkdir(parents=True, exist_ok=True)
 
-    if sys.platform == "win32":
-        cmake_args = [
-            "cmake",
-            "-S",
-            str(ld_dir.absolute()),
-            "-B",
-            str(ld_build_dir.absolute()),
-            "-DCMAKE_BUILD_TYPE=Release",
-            "-DLIBDEFLATE_BUILD_SHARED_LIB=OFF",
-            "-DLIBDEFLATE_BUILD_GZIP=OFF",
-            "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
-        ]
-        try:
-            subprocess.check_call(cmake_args)
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"CMake configuration failed with error: {e}\n\n"
-                "Please ensure CMake is installed:\n"
-                "  pip: pip install cmake\n"
-            )
-        subprocess.check_call(["cmake", "--build", str(ld_build_dir), "--config", "Release"])
-        lib_path = ld_build_dir / "Release" / "deflatestatic.lib"
-    else:
-        # On Unix-like systems, compile directly. libdeflate is plain C with no
-        # configuration step, so this avoids a CMake dependency entirely.
-        sources = sorted(str(p) for p in ld_dir.glob("lib/*.c"))
-        sources += sorted(str(p) for p in ld_dir.glob("lib/*/*.c"))
+    # Compile directly: libdeflate is plain C with no
+    # configuration step, so this avoids a CMake dependency entirely.
+    sources = sorted(str(p) for p in ld_dir.glob("lib/*.c"))
+    sources += sorted(str(p) for p in ld_dir.glob("lib/*/*.c"))
 
-        compiler = new_compiler()
-        if sys.platform == "darwin":
-            compiler.compiler_so[0] = "clang"
-            compiler.compiler[0] = "clang"
+    compiler = new_compiler()
+    if sys.platform == "darwin":
+        compiler.compiler_so[0] = "clang"
+        compiler.compiler[0] = "clang"
 
-        compile_args = ["-O2", "-fPIC", "-I" + str(ld_dir)]
-        objects = compiler.compile(sources, output_dir=str(ld_build_dir), extra_preargs=compile_args)
+    compile_args = ["-O2", "-fPIC"] + jcc_erratum_args() + ["-I" + str(ld_dir)]
+    objects = compiler.compile(sources, output_dir=str(ld_build_dir), extra_preargs=compile_args)
 
-        lib_path = ld_build_dir / "libdeflate.a"
-        subprocess.check_call(["ar", "rcs", str(lib_path)] + objects)
+    lib_path = ld_build_dir / "libdeflate.a"
+    subprocess.check_call(["ar", "rcs", str(lib_path)] + objects)
 
     if not lib_path.exists():
         raise RuntimeError(f"Failed to find built libdeflate library at {lib_path}")
@@ -138,93 +146,68 @@ def build_zstd():
 
     zstd_build_dir.mkdir(parents=True, exist_ok=True)
 
-    if sys.platform == "win32":
-        cmake_args = [
-            "cmake",
-            "-S",
-            str(zstd_dir / "build" / "cmake"),
-            "-B",
-            str(zstd_build_dir),
-            "-DCMAKE_BUILD_TYPE=Release",
-            "-DZSTD_BUILD_PROGRAMS=OFF",
-            "-DZSTD_BUILD_SHARED=OFF",
-            "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
-        ]
-        try:
-            subprocess.check_call(cmake_args)
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"CMake configuration failed with error: {e}\n\n"
-                "Please ensure CMake is installed:\n"
-                "  Ubuntu/Debian: sudo apt-get install cmake\n"
-                "  macOS: brew install cmake\n"
-                "  pip: pip install cmake\n"
-            )
-        subprocess.check_call(["cmake", "--build", str(zstd_build_dir), "--config", "Release"])
-        lib_path = zstd_build_dir / "lib" / "Release" / "zstd_static.lib"
-    else:
-        # On Unix-like systems, compile directly
-        sources = [
-            "common/debug.c",
-            "common/entropy_common.c",
-            "common/error_private.c",
-            "common/fse_decompress.c",
-            "common/pool.c",
-            "common/threading.c",
-            "common/xxhash.c",
-            "common/zstd_common.c",
-            "compress/fse_compress.c",
-            "compress/hist.c",
-            "compress/huf_compress.c",
-            "compress/zstd_compress.c",
-            "compress/zstd_compress_literals.c",
-            "compress/zstd_compress_sequences.c",
-            "compress/zstd_compress_superblock.c",
-            "compress/zstd_double_fast.c",
-            "compress/zstd_fast.c",
-            "compress/zstd_lazy.c",
-            "compress/zstd_ldm.c",
-            "compress/zstd_opt.c",
-            "compress/zstdmt_compress.c",
-            "decompress/huf_decompress.c",
-            "decompress/zstd_ddict.c",
-            "decompress/zstd_decompress.c",
-            "decompress/zstd_decompress_block.c",
-            "dictBuilder/cover.c",
-            "dictBuilder/divsufsort.c",
-            "dictBuilder/fastcover.c",
-            "dictBuilder/zdict.c",
-        ]
+    # Compile directly, without CMake
+    sources = [
+        "common/debug.c",
+        "common/entropy_common.c",
+        "common/error_private.c",
+        "common/fse_decompress.c",
+        "common/pool.c",
+        "common/threading.c",
+        "common/xxhash.c",
+        "common/zstd_common.c",
+        "compress/fse_compress.c",
+        "compress/hist.c",
+        "compress/huf_compress.c",
+        "compress/zstd_compress.c",
+        "compress/zstd_compress_literals.c",
+        "compress/zstd_compress_sequences.c",
+        "compress/zstd_compress_superblock.c",
+        "compress/zstd_double_fast.c",
+        "compress/zstd_fast.c",
+        "compress/zstd_lazy.c",
+        "compress/zstd_ldm.c",
+        "compress/zstd_opt.c",
+        "compress/zstdmt_compress.c",
+        "decompress/huf_decompress.c",
+        "decompress/zstd_ddict.c",
+        "decompress/zstd_decompress.c",
+        "decompress/zstd_decompress_block.c",
+        "dictBuilder/cover.c",
+        "dictBuilder/divsufsort.c",
+        "dictBuilder/fastcover.c",
+        "dictBuilder/zdict.c",
+    ]
 
-        asm_sources = []
-        if platform.machine() in ["x86_64", "AMD64"] and sys.platform == "linux":
-            asm_sources.append("decompress/huf_decompress_amd64.S")
+    asm_sources = []
+    if platform.machine() in ["x86_64", "AMD64"] and sys.platform == "linux":
+        asm_sources.append("decompress/huf_decompress_amd64.S")
 
-        compiler = new_compiler()
+    compiler = new_compiler()
+    if sys.platform == "darwin":
+        compiler.compiler_so[0] = "clang"
+        compiler.compiler[0] = "clang"
+
+    objects = []
+    for src in sources:
+        src_path = zstd_lib_dir / src
+        compile_args = ["-O3", "-fPIC", "-I" + str(zstd_lib_dir), "-I" + str(zstd_lib_dir / "common")]
         if sys.platform == "darwin":
-            compiler.compiler_so[0] = "clang"
-            compiler.compiler[0] = "clang"
+            compile_args.extend(["-stdlib=libc++"])
 
-        objects = []
-        for src in sources:
-            src_path = zstd_lib_dir / src
-            compile_args = ["-O3", "-fPIC", "-I" + str(zstd_lib_dir), "-I" + str(zstd_lib_dir / "common")]
-            if sys.platform == "darwin":
-                compile_args.extend(["-stdlib=libc++"])
+        obj_files = compiler.compile([str(src_path)], output_dir=str(zstd_build_dir), extra_preargs=compile_args)
+        if obj_files:
+            objects.extend(obj_files)
 
-            obj_files = compiler.compile([str(src_path)], output_dir=str(zstd_build_dir), extra_preargs=compile_args)
-            if obj_files:
-                objects.extend(obj_files)
+    for asm_src in asm_sources:
+        asm_path = zstd_lib_dir / asm_src
+        asm_obj_path = zstd_build_dir / (asm_src.replace("/", "_").replace(".S", ".o"))
+        asm_compile_cmd = ["gcc", "-c", "-fPIC", str(asm_path), "-o", str(asm_obj_path)]
+        subprocess.check_call(asm_compile_cmd)
+        objects.append(str(asm_obj_path))
 
-        for asm_src in asm_sources:
-            asm_path = zstd_lib_dir / asm_src
-            asm_obj_path = zstd_build_dir / (asm_src.replace("/", "_").replace(".S", ".o"))
-            asm_compile_cmd = ["gcc", "-c", "-fPIC", str(asm_path), "-o", str(asm_obj_path)]
-            subprocess.check_call(asm_compile_cmd)
-            objects.append(str(asm_obj_path))
-
-        lib_path = zstd_build_dir / "libzstd.a"
-        subprocess.check_call(["ar", "rcs", str(lib_path)] + objects)
+    lib_path = zstd_build_dir / "libzstd.a"
+    subprocess.check_call(["ar", "rcs", str(lib_path)] + objects)
 
     if not lib_path.exists():
         raise RuntimeError(f"Failed to find built zstd library at {lib_path}")
@@ -318,8 +301,7 @@ performance and consistency. The build failed with the above error.
 
 Possible solutions:
 1. Ensure you have a C and C++ compiler installed
-2. On Windows, ensure you have CMake installed: pip install cmake
-3. Check the error message above for specific issues
+2. Check the error message above for specific issues
 
 If you want to use system libraries instead (not recommended), you can:
   LAZYBGEN_USE_SYSTEM_LIBS=1 pip install lazybgen

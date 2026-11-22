@@ -21,7 +21,7 @@ workloads stay cheap when only a slice is fetched over the network.
 
 Local timings are page-cache-warm (a warmup pass precedes the measured runs), so
 they isolate decode/parse cost rather than first-touch disk I/O. The median of
-``--num-runs`` runs is reported; peak RSS is sampled in a background thread.
+``--num-runs`` runs is reported; peak RSS is the kernel's ``VmHWM``, reset per run.
 """
 
 import argparse
@@ -228,11 +228,17 @@ def bgen_workloads(bf, samples, variants):
         finally:
             r.close()
 
+    # bgen's alt_dosage is float32; every workload fills a float64 matrix, as
+    # lazybgen returns, so both sides produce the same output.
     def region_w():
         r = BgenReader(str(bf))
         try:
-            rows = [v.alt_dosage for v in r.fetch(CHROM, rstart, rend)]
-            return np.asarray(rows)
+            out = np.empty((REGION_VARIANTS, samples), dtype=np.float64)
+            n = 0
+            for v in r.fetch(CHROM, rstart, rend):
+                out[n] = v.alt_dosage
+                n += 1
+            return out[:n]
         finally:
             r.close()
 
@@ -249,7 +255,7 @@ def bgen_workloads(bf, samples, variants):
     def single_w():
         r = BgenReader(str(bf))
         try:
-            return np.asarray(r.at_position(spt)[0].alt_dosage)
+            return np.asarray(r.at_position(spt)[0].alt_dosage, dtype=np.float64)
         finally:
             r.close()
 

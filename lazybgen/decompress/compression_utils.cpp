@@ -70,13 +70,16 @@ CompressionResult decompress_zlib(const uint8_t* compressed, size_t compressed_s
         return CompressionResult(false, "Failed to allocate DEFLATE decompressor");
     }
 
-    // Select the stream format from the leading bytes.
-    // BGEN v1.1 uses standard zlib (with header)
-    // BGEN v1.2 uses raw deflate (no header)
-    const bool zlib_wrapped =
-        compressed_size >= 2 && compressed[0] == 0x78 &&
-        (compressed[1] == 0x01 || compressed[1] == 0x5E || compressed[1] == 0x9C ||
-         compressed[1] == 0xDA);
+    // The BGEN spec stores zlib-compressed blocks in the zlib format (RFC 1950:
+    // a 2-byte header, the deflate stream, an Adler-32 trailer) for every
+    // layout. Recognize any valid header, not only the 32 KiB-window 0x78 ones a
+    // default zlib writes: CM = 8 (deflate), CINFO <= 7 (window up to 32 KiB),
+    // no preset dictionary (BGEN defines none), and the FCHECK bits making the
+    // big-endian 16-bit header a multiple of 31. Streams without such a header
+    // are read as raw deflate, which some non-conforming writers produce.
+    const bool zlib_wrapped = compressed_size >= 2 && (compressed[0] & 0x0F) == 8 &&
+                              (compressed[0] >> 4) <= 7 && (compressed[1] & 0x20) == 0 &&
+                              ((compressed[0] << 8) | compressed[1]) % 31 == 0;
 
     // The caller supplies the exact size the block declares, so pass a non-NULL
     // actual_out_nbytes_ret: a stream that yields fewer bytes returns the short
@@ -88,6 +91,24 @@ CompressionResult decompress_zlib(const uint8_t* compressed, size_t compressed_s
                                                   output_size, &bytes_written)
                      : libdeflate_deflate_decompress(decompressor, compressed, compressed_size,
                                                      output, output_size, &bytes_written);
+    if (zlib_wrapped && (result != LIBDEFLATE_SUCCESS || bytes_written != output_size)) {
+        // A raw deflate stream can begin with bytes that happen to form a valid
+        // zlib header (a non-final stored block starting 0x08). Read as zlib, such
+        // a stream fails or comes up short, so read it as raw deflate, the way it
+        // was read before the header check, and keep that result only when it
+        // yields exactly the declared size.
+        size_t raw_written = 0;
+        const enum libdeflate_result raw = libdeflate_deflate_decompress(
+            decompressor, compressed, compressed_size, output, output_size, &raw_written);
+        if (raw == LIBDEFLATE_SUCCESS && raw_written == output_size) {
+            result = raw;
+            bytes_written = raw_written;
+        } else if (result == LIBDEFLATE_SUCCESS) {
+            // The zlib read succeeded short; redo it so the caller sees its bytes.
+            result = libdeflate_zlib_decompress(decompressor, compressed, compressed_size, output,
+                                                output_size, &bytes_written);
+        }
+    }
 
     if (result == LIBDEFLATE_SUCCESS) {
         return CompressionResult(true, "", bytes_written);
