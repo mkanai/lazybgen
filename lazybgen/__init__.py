@@ -158,7 +158,10 @@ def load_bgen(
     index_path : str, optional
         Path to BGI index file. If None, will look for file_path + '.bgi'
     sample_path : str, optional
-        Path to sample file
+        Local Oxford ``.sample`` file, one row per BGEN sample in file order
+        (all samples, even when ``sample_ids`` selects a subset), else
+        ``ValueError``. Its ID_2 column overrides embedded IDs. See
+        ``BgenReader.sample_id_source``.
     region : str, optional
         Genomic region in format "chr:start-end"
     variant_filter : dict, optional

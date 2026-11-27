@@ -76,7 +76,7 @@ A `.bgi` index is required; create one with `bgenix -g file.bgen`.
 
 - `file_path`: path, `gs://`, or `s3://` URL to the BGEN file
 - `index_path`: `.bgi` index (defaults to `file_path + ".bgi"`)
-- `sample_path`: optional `.sample` file
+- `sample_path`: optional local Oxford `.sample` file with one row per BGEN sample, in file order (else `ValueError`); its ID_2 column overrides IDs embedded in the BGEN. Without it, sample IDs are the embedded ones or `sample_0 .. sample_{n-1}` placeholders; `BgenReader.sample_id_source` tells which
 - `region`: `"chr:start-end"` to read a genomic interval
 - `variant_filter`: variant subset as a dict with keys `chromosome`, `positions`,
   `allele1` and `allele2`, the three lists aligned element by element and the

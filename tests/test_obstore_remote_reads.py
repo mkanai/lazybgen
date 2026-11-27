@@ -175,3 +175,49 @@ def test_storage_options_reach_the_store(stand_in_obstore):
     assert key == "example.16bits.bgen"
     assert store.bucket == "stand-in-bucket"
     assert store.kwargs["client_options"]["default_headers"]["x-goog-user-project"] == "billed-project"
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [("example.16bits.bgen", True), ("data.bgen", False)],
+)
+def test_obstore_reader_reports_the_embedded_id_flag(monkeypatch, name, expected):
+    """has_embedded_sample_ids comes from the header the obstore reader parses at open."""
+    module, store_module = _make_stand_in_obstore((DATA_DIR / name).read_bytes(), [])
+    monkeypatch.setitem(sys.modules, "obstore", module)
+    monkeypatch.setitem(sys.modules, "obstore.store", store_module)
+    obstore_backend.clear_store_cache()
+    try:
+        url = f"gs://stand-in-bucket/{name}"
+        with BgenReader(url, bgi_path=str(DATA_DIR / f"{name}.bgi"), remote_backend="obstore") as remote:
+            assert remote.has_embedded_sample_ids is expected
+            assert remote.sample_id_source == ("embedded" if expected else "placeholder")
+            with BgenReader(str(DATA_DIR / name)) as local:
+                assert remote.samples == local.samples
+    finally:
+        obstore_backend.clear_store_cache()
+
+
+def test_obstore_reader_with_a_sample_file_keeps_the_flag(monkeypatch, tmp_path):
+    name = "example.16bits.bgen"
+    """With a sample_path the obstore reader drops the embedded block it fetched,
+    but the header flag stays, and the .sample file supplies the IDs."""
+    module, store_module = _make_stand_in_obstore((DATA_DIR / name).read_bytes(), [])
+    monkeypatch.setitem(sys.modules, "obstore", module)
+    monkeypatch.setitem(sys.modules, "obstore.store", store_module)
+    obstore_backend.clear_store_cache()
+    with BgenReader(str(DATA_DIR / name)) as local:
+        n = local.nsamples
+    sample = tmp_path / "remote.sample"
+    ids = [f"R{i}" for i in range(n)]
+    sample.write_text("ID_1 ID_2 missing\n0 0 0\n" + "".join(f"f{i} {s} 0\n" for i, s in enumerate(ids)))
+    try:
+        url = f"gs://stand-in-bucket/{name}"
+        with BgenReader(
+            url, bgi_path=str(DATA_DIR / f"{name}.bgi"), sample_path=str(sample), remote_backend="obstore"
+        ) as remote:
+            assert remote.has_embedded_sample_ids is True
+            assert remote.sample_id_source == "sample_file"
+            assert remote.samples == ids
+    finally:
+        obstore_backend.clear_store_cache()

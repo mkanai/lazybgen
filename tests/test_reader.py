@@ -1182,12 +1182,21 @@ def test_samples_from_sample_file_match_second_column(test_paths):
         assert reader.samples == expected
 
 
-def test_sample_file_rows_with_too_few_fields_are_skipped(test_paths, tmp_path):
-    """A row without at least two fields contributes no sample ID."""
-    ragged = tmp_path / "ragged.sample"
-    ragged.write_text("ID_1 ID_2 missing\n0 0 0\nA A 0\nB\n\nC C 0\n")
-    with BgenReader(str(test_paths["bgen_file"]), sample_path=str(ragged)) as reader:
-        assert reader.samples == ["A", "C"]
+def test_sample_file_blank_lines_are_skipped_and_one_field_rows_rejected(test_paths, tmp_path):
+    """Blank lines carry no sample; a one-field row would shift later IDs, so it raises."""
+    with BgenReader(str(test_paths["bgen_file"])) as reader:
+        n = reader.nsamples
+    ids = [f"S{i}" for i in range(n)]
+    body = "".join(f"{sid} {sid} 0\n\n" for sid in ids)
+    spaced = tmp_path / "spaced.sample"
+    spaced.write_text("ID_1 ID_2 missing\n0 0 0\n" + body)
+    with BgenReader(str(test_paths["bgen_file"]), sample_path=str(spaced)) as reader:
+        assert reader.samples == ids
+    short = tmp_path / "short.sample"  # one row dropped, one surplus: the count alone would pass
+    short.write_text("ID_1 ID_2 missing\n0 0 0\nA\n" + "".join(f"{sid} {sid} 0\n" for sid in ids))
+    with BgenReader(str(test_paths["bgen_file"]), sample_path=str(short)) as reader:
+        with pytest.raises(ValueError, match="data row 1 has no ID_2"):
+            reader.samples
 
 
 def test_nonexistent_sample_file_raises_at_open(test_paths, tmp_path):
