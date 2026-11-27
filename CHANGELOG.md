@@ -5,6 +5,16 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-27
+
+### Added
+
+- **`BgenReader.has_embedded_sample_ids` and `BgenReader.sample_id_source`.** The header flag (bit 31), and `"sample_file"`, `"embedded"` or `"placeholder"` for where `samples` comes from; neither materializes the IDs. Embedded IDs can themselves be named `sample_<i>`, so `samples` alone could not tell them from placeholders.
+
+### Changed
+
+- **Breaking: a `.sample` file must have one ID_2 per BGEN sample.** Neither the row count nor one-field rows were checked, so a mismatched file silently mislabeled samples. Such a file now raises `ValueError` at the first `samples` access, and so in `load_bgen`; reads that never touch `samples` do not check. Blank lines are still skipped.
+
 ## [0.3.0] - 2026-11-21
 
 A performance and correctness release, and the first since 0.2.0 (0.2.1 was
@@ -208,6 +218,7 @@ byte-range reads. It was extracted from
   (manylinux/musllinux x86_64, macOS arm64). `get_build_info()` reports the
   compression backend the package was built against.
 
+[0.4.0]: https://github.com/mkanai/lazybgen/releases/tag/v0.4.0
 [0.3.0]: https://github.com/mkanai/lazybgen/releases/tag/v0.3.0
 [0.2.0]: https://github.com/mkanai/lazybgen/releases/tag/v0.2.0
 [0.1.0]: https://github.com/mkanai/lazybgen/releases/tag/v0.1.0
