@@ -57,6 +57,7 @@ def test_a_malformed_id_raises_when_the_ids_are_first_read(tmp_path):
     path.write_bytes(bytes(raw))
     with BgenReader(str(path)) as reader:
         reader.load_variants()  # the genotypes are unaffected
+        assert reader.sample_id_source == "embedded"  # the header flag, not the IDs
         with pytest.raises(RuntimeError, match="(?i)sample ID"):
             reader.samples
 

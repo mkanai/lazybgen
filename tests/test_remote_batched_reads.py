@@ -176,3 +176,37 @@ def test_a_truncated_range_is_reported(stand_in_gcs):
     with _open_remote() as remote:
         with pytest.raises(Exception, match="Failed to read complete variant record"):
             remote.load_variants(dtype=np.float32)
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [("example.16bits.bgen", True), ("data.bgen", False)],
+)
+def test_remote_reader_reports_the_embedded_id_flag(stand_in_gcs, name, expected):
+    """has_embedded_sample_ids comes from the header a remote reader parses at open."""
+    stand_in_gcs.payload = (DATA_DIR / name).read_bytes()
+    url = f"gs://stand-in-bucket/{name}"
+    with BgenReader(url, bgi_path=str(DATA_DIR / f"{name}.bgi"), remote_backend="fsspec") as remote:
+        assert remote.has_embedded_sample_ids is expected
+        assert remote.sample_id_source == ("embedded" if expected else "placeholder")
+        with BgenReader(str(DATA_DIR / name)) as local:
+            assert remote.samples == local.samples
+
+
+def test_remote_reader_with_a_sample_file_keeps_the_flag(stand_in_gcs, tmp_path):
+    name = "example.16bits.bgen"
+    """With a sample_path the remote reader drops its copy of the embedded block,
+    but the header flag stays, and the .sample file supplies the IDs."""
+    stand_in_gcs.payload = (DATA_DIR / name).read_bytes()
+    with BgenReader(str(DATA_DIR / name)) as local:
+        n = local.nsamples
+    sample = tmp_path / "remote.sample"
+    ids = [f"R{i}" for i in range(n)]
+    sample.write_text("ID_1 ID_2 missing\n0 0 0\n" + "".join(f"f{i} {s} 0\n" for i, s in enumerate(ids)))
+    url = f"gs://stand-in-bucket/{name}"
+    with BgenReader(
+        url, bgi_path=str(DATA_DIR / f"{name}.bgi"), sample_path=str(sample), remote_backend="fsspec"
+    ) as remote:
+        assert remote.has_embedded_sample_ids is True
+        assert remote.sample_id_source == "sample_file"
+        assert remote.samples == ids

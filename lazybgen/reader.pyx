@@ -57,6 +57,14 @@ np.import_array()
 _SAMPLE_ID_CACHE = {}
 
 
+def _check_sample_row_count(n_rows, n_samples, sample_path):
+    if n_rows != n_samples:
+        raise ValueError(
+            f".sample file has {n_rows} sample rows but the BGEN has "
+            f"{n_samples} samples: {sample_path}"
+        )
+
+
 def _sample_file_key(sample_path):
     """Identity + content stamp for a .sample file, or None if it cannot be stat'd."""
     try:
@@ -89,7 +97,9 @@ cdef class BgenReader:
         bgi_path : str, optional
             Path to BGI index file. If None, will look for file_path + '.bgi'
         sample_path : str, optional
-            Path to sample file
+            Local Oxford ``.sample`` file, one row per BGEN sample in file
+            order; a row-count mismatch raises ``ValueError`` when ``samples``
+            is first read. Its ID_2 column overrides embedded IDs.
         num_threads : int, optional
             Worker threads for decoding. Must be >= 0. 0 (default) decodes blocks in
             parallel with one worker per CPU the job may use (on Linux, its CPU
@@ -224,7 +234,9 @@ cdef class BgenReader:
                 )
 
     def _load_samples_from_file(self, sample_path: str):
-        """Load sample IDs from .sample file."""
+        """Return the .sample IDs as a new list, validated before it is
+        stored or cached."""
+        cdef uint32_t n_samples = self.header_info.n_samples
         # Reuse the last file parsed, if this is that same file unchanged.
         # Parsing is ~500K Python strings at biobank scale and dominates a
         # load_bgen call that reads only a handful of variants, so a loop of
@@ -233,10 +245,12 @@ cdef class BgenReader:
         if cache_key is not None:
             cached = _SAMPLE_ID_CACHE.get(cache_key)
             if cached is not None:
+                # The cache is keyed by the file alone, so check its count
+                # against this BGEN too.
+                _check_sample_row_count(len(cached), n_samples, sample_path)
                 # A fresh list each time: the caller owns what it is handed and
                 # may mutate it, which must not reach the next reader.
-                self.sample_ids = list(cached)
-                return
+                return list(cached)
 
         with open(sample_path, 'r') as f:
             # Skip the two header lines validated at open.
@@ -247,23 +261,30 @@ cdef class BgenReader:
             # Column 2 (ID_2) is the primary ID. split(None, 2) stops after the
             # field we want instead of splitting every remaining column, and it
             # already ignores surrounding whitespace, so no separate strip() is
-            # needed. A row without at least two fields carries no ID.
-            self.sample_ids = [
-                parts[1]
+            # needed. Blank lines are skipped; a row with one field is an error,
+            # since dropping it would shift every later ID onto the wrong sample.
+            ids = [
+                parts[1] if len(parts) >= 2 else None
                 for parts in (line.split(None, 2) for line in f)
-                if len(parts) >= 2
+                if parts
             ]
+        if None in ids:
+            raise ValueError(
+                f".sample data row {ids.index(None) + 1} has no ID_2 column: {sample_path}"
+            )
+        _check_sample_row_count(len(ids), n_samples, sample_path)
 
         if cache_key is not None:
             # One file only: the pattern this serves is repeated loads over a
             # single cohort, and the IDs are tens of megabytes to hold.
             _SAMPLE_ID_CACHE.clear()
-            _SAMPLE_ID_CACHE[cache_key] = tuple(self.sample_ids)
+            _SAMPLE_ID_CACHE[cache_key] = tuple(ids)
+        return ids
 
     cdef void _load_samples(self) except *:
         """Materialize the sample IDs from whichever source was configured."""
         if self.sample_path:
-            self._load_samples_from_file(self.sample_path)
+            self.sample_ids = self._load_samples_from_file(self.sample_path)
         else:
             self._load_samples_from_bgen()
 
@@ -982,10 +1003,31 @@ cdef class BgenReader:
 
     @property
     def samples(self) -> List[str]:
-        """List of sample IDs (materialized on first access, then cached)."""
+        """List of sample IDs (materialized on first access, then cached).
+
+        Taken from ``sample_path`` (ID_2) if given, else the BGEN's embedded
+        block, else placeholders ``sample_0 .. sample_{n-1}``. The list cannot
+        tell these apart; ``sample_id_source`` can.
+        """
         if self.sample_ids is None:
             self._load_samples()
         return self.sample_ids
+
+    @property
+    def has_embedded_sample_ids(self) -> bool:
+        """Whether the BGEN header flags embedded sample IDs (bit 31).
+
+        Independent of ``sample_path``; does not materialize the IDs.
+        """
+        return self.header_info.has_sample_ids
+
+    @property
+    def sample_id_source(self) -> str:
+        """``"sample_file"``, ``"embedded"`` or ``"placeholder"``: where
+        ``samples`` comes from, without materializing it."""
+        if self.sample_path:
+            return "sample_file"
+        return "embedded" if self.header_info.has_sample_ids else "placeholder"
     
     @property
     def compression(self) -> str:
